@@ -73,7 +73,7 @@ After installation, you can execute aml-flash-tool.sh from anywhere:
 
 ```bash
 $ aml-flash-tool.sh --help
-Usage: aml-flash-tool.sh [options] path/to/aml_upgrade_package.img
+Usage: aml-flash-tool.sh [options] [path/to/aml_upgrade_package.img]
 Supported SoC Families:
   gxl   : S905X, S905D, S905W, S905L, S805X (p212, p281, p271, B860H, HG680P, etc.)
   gxbb  : S905, S905H (p200, p201, Odroid C2, etc.)
@@ -85,6 +85,7 @@ Supported SoC Families:
   txlx  : T962, T962E, T962X
   m8    : S802, S805, S812 (Meson8, Meson8b)
 Options:
+  --tui, -i                     Launch interactive text user interface
   --board=<name>                Target board/device (e.g. p212, b860h, hg680p, radxa-zero)
   --soc=<family>                Target SoC family (gxl, gxbb, gxm, g12a, g12b, sm1, axg, txlx, m8)
   --img=path/to/image.img        Upgrade image package
@@ -96,11 +97,17 @@ Options:
   --efuse-file=path/to/efuse     Program eFuse file
   --password=path/to/password    Password file for locked USB mode
   --destroy                      Erase bootloader and reset board
+  --erase-bootloader             Erase bootloader on connected device
+  --reflash-bootloader           Erase and re-flash bootloader on connected device
+  --mount-emmc, --ums            Access internal eMMC as USB Mass Storage
+  --mmc-dev=<0|1>                Target MMC device for storage mode (default: 1 for eMMC)
+  --read-uart[=dev], --uart      Read UART serial console over USB
+  --baud=<rate>                  UART baud rate (default: 115200)
   --debug                        Enable debug messages
   --help, -h                     Display this help message
 ```
 
-## Flash
+## Features and Usage
 
 ### Interactive TUI Mode
 
@@ -110,7 +117,77 @@ You can run the interactive menu by executing without arguments or by passing `-
 aml-flash-tool.sh --tui
 ```
 
-The TUI allows you to select the image file, choose target SoC or board profiles, select partitions to burn, toggle wipe/reset preferences, inspect device connection status, and configure advanced parameters.
+The TUI provides a complete menu to:
+- Select and unpack upgrade images
+- Choose SoC family or specific board presets
+- Select specific partition(s) to flash
+- Mount internal eMMC as USB Mass Storage (UMS)
+- Read UART serial console over USB
+- Erase or re-flash bootloader
+- Toggle wipe, reset, debug, and advanced parameters
+
+### Read UART from USB
+
+To monitor or read the serial console output from a connected USB-to-UART adapter:
+
+Auto-detect port and connect at default 115200 baud:
+
+```bash
+aml-flash-tool.sh --read-uart
+```
+
+Specify port and baud rate:
+
+```bash
+aml-flash-tool.sh --read-uart=/dev/ttyUSB0 --baud=115200
+aml-flash-tool.sh --read-uart=/dev/ttyUSB0 --baud=921600
+```
+
+### Access eMMC as Mountable Storage (UMS Mode)
+
+You can expose the internal eMMC (or SD card) of the connected device as standard USB Mass Storage to mount partitions on your host computer:
+
+```bash
+aml-flash-tool.sh --mount-emmc --img=path/to/image.img
+```
+
+Or for SD card (MMC 0):
+
+```bash
+aml-flash-tool.sh --mount-emmc --mmc-dev=0 --img=path/to/image.img
+```
+
+If the board is already running U-Boot in RAM:
+
+```bash
+aml-flash-tool.sh --mount-emmc
+```
+
+Once UMS mode is active, inspect block devices on the host (`lsblk` or `dmesg`) and mount partitions directly:
+
+```bash
+sudo mount /dev/sdX1 /mnt
+```
+
+### Erase and Re-flash Bootloader
+
+To erase the bootloader from the connected device:
+
+```bash
+aml-flash-tool.sh --erase-bootloader --img=path/to/image.img
+```
+
+To erase and re-flash a new bootloader from an upgrade image package:
+
+```bash
+aml-flash-tool.sh --reflash-bootloader --img=path/to/image.img
+```
+
+To erase and re-flash a standalone bootloader binary file:
+
+```bash
+aml-flash-tool.sh --reflash-bootloader --img=path/to/image.img --uboot-file=path/to/u-boot.bin
+```
 
 ### Run into maskrom mode
 

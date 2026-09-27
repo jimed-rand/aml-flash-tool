@@ -11,6 +11,10 @@ uboot_file=""
 efuse_file=""
 password=""
 destroy=0
+action="flash"
+uart_port=""
+uart_baud="115200"
+mmc_dev=1
 update_return=""
 debug=0
 simu=0
@@ -45,6 +49,12 @@ show_help() {
     echo "  --efuse-file=path/to/efuse     Program eFuse file"
     echo "  --password=path/to/password    Password file for locked USB mode"
     echo "  --destroy                      Erase bootloader and reset board"
+    echo "  --erase-bootloader             Erase bootloader on connected device"
+    echo "  --reflash-bootloader           Erase and re-flash bootloader on connected device"
+    echo "  --mount-emmc, --ums            Access internal eMMC as USB Mass Storage"
+    echo "  --mmc-dev=<0|1>                Target MMC device for storage mode (default: 1 for eMMC)"
+    echo "  --read-uart[=dev], --uart      Read UART serial console over USB"
+    echo "  --baud=<rate>                  UART baud rate (default: 115200)"
     echo "  --debug                        Enable debug messages"
     echo "  --help, -h                     Display this help message"
 }
@@ -101,6 +111,7 @@ run_update_return() {
     local cmd
     local need_spaces
     local arg
+    local cmd_exit=0
 
     cmd="$TOOL_PATH/tools/$SYSTEM/update$EXE 2>/dev/null"
     need_spaces=0
@@ -125,18 +136,21 @@ run_update_return() {
     update_return=""
     print_debug "Command -> $cmd"
     if [[ "$simu" != "1" ]]; then
-        update_return=$(eval "$cmd")
+        update_return=$(eval "$cmd") || cmd_exit=$?
     fi
     print_debug "- Results ---------------------------------------------------"
     print_debug "$update_return"
+    print_debug "Exit code: $cmd_exit"
     print_debug "-------------------------------------------------------------"
-    return 0
+    return $cmd_exit
 }
 
 run_update() {
     local ret=0
-    run_update_return "$@"
-    if echo "$update_return" | grep -q "ERR"; then
+    if ! run_update_return "$@"; then
+        ret=1
+    fi
+    if echo "$update_return" | grep -iq "ERR" || echo "$update_return" | grep -iq "failed:"; then
         ret=1
     fi
     return $ret
@@ -150,21 +164,111 @@ run_update_assert() {
     fi
 }
 
+is_in_rom_mode() {
+    run_update_return bulkcmd "echo 12345"
+    if echo "$update_return" | grep -iq "AmlUsbRom"; then
+        return 0
+    fi
+    return 1
+}
+
 check_device_status() {
     detect_system
     local status_output
-    status_output=$("$TOOL_PATH/tools/$SYSTEM/update$EXE" identify 7 2>&1 || true)
+    local exit_code=0
+    status_output=$("$TOOL_PATH/tools/$SYSTEM/update$EXE" identify 7 2>&1) || exit_code=$?
     echo ""
     echo "================ Device Status ================"
-    if echo "$status_output" | grep -iq "firmware"; then
+    if echo "$status_output" | grep -iq "firmware" || lsusb 2>/dev/null | grep -iq "1b8e:c003"; then
         echo "Status: Connected (Amlogic device detected in USB/MaskROM mode)"
-        echo "Identification: $status_output"
+        if lsusb 2>/dev/null | grep -iq "1b8e:c003"; then
+            echo "USB Device: $(lsusb 2>/dev/null | grep -i "1b8e:c003" | head -n 1)"
+        fi
+        echo "Mode: MaskROM / USB update mode"
     else
         echo "Status: Not detected"
         echo "Make sure the board is connected via USB OTG in MaskROM or update mode."
     fi
     echo "==============================================="
     echo ""
+}
+
+read_uart() {
+    local port="$1"
+    local baud="${2:-115200}"
+    local available_ports=()
+
+    if [[ -z "$port" ]]; then
+        mapfile -t available_ports < <(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || true)
+        if [[ ${#available_ports[@]} -eq 0 ]]; then
+            echo "No USB UART devices found (/dev/ttyUSB* or /dev/ttyACM*)."
+            echo "Ensure your USB serial adapter is connected."
+            return 1
+        elif [[ ${#available_ports[@]} -eq 1 ]]; then
+            port="${available_ports[0]}"
+        else
+            echo "Multiple USB UART devices found:"
+            local idx=1
+            for p in "${available_ports[@]}"; do
+                echo "  [$idx] $p"
+                ((idx++))
+            done
+            local choice
+            read -r -p "Select device [1-${#available_ports[@]}]: " choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#available_ports[@]} )); then
+                port="${available_ports[$((choice - 1))]}"
+            else
+                echo "Invalid selection."
+                return 1
+            fi
+        fi
+    fi
+
+    if [[ ! -e "$port" ]]; then
+        echo "Serial port $port does not exist."
+        return 1
+    fi
+
+    echo ""
+    echo "================ USB UART Monitor ================"
+    echo "Port     : $port"
+    echo "Baud Rate: $baud"
+    echo "Press Ctrl+C to exit."
+    echo "=================================================="
+    echo ""
+
+    if command -v picocom >/dev/null 2>&1; then
+        picocom -q -b "$baud" "$port"
+    elif command -v minicom >/dev/null 2>&1; then
+        minicom -D "$port" -b "$baud"
+    elif command -v tio >/dev/null 2>&1; then
+        tio -b "$baud" "$port"
+    elif command -v screen >/dev/null 2>&1; then
+        screen "$port" "$baud"
+    else
+        stty -F "$port" "$baud" raw -echo -echoe -echok 2>/dev/null || true
+        cat "$port"
+    fi
+}
+
+mount_emmc_storage() {
+    local dev_target="${1:-1}"
+    mmc_dev="$dev_target"
+    action="mount_emmc"
+    parts="none"
+    execute_flash
+}
+
+erase_bootloader_action() {
+    action="erase_bootloader"
+    parts="none"
+    execute_flash
+}
+
+reflash_bootloader_action() {
+    action="reflash_bootloader"
+    parts="bootloader"
+    execute_flash
 }
 
 tui_select_image() {
@@ -306,6 +410,153 @@ tui_advanced_options() {
     done
 }
 
+tui_uart_menu() {
+    local choice
+    local custom_baud
+    local selected_baud="115200"
+    local selected_port=""
+    local available_ports=()
+
+    mapfile -t available_ports < <(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || true)
+
+    if [[ ${#available_ports[@]} -eq 0 ]]; then
+        echo ""
+        echo "No USB UART devices found (/dev/ttyUSB* or /dev/ttyACM*)."
+        read -r -p "Enter custom serial device path (or leave empty to cancel): " selected_port
+        if [[ -z "$selected_port" ]]; then
+            return 0
+        fi
+    elif [[ ${#available_ports[@]} -eq 1 ]]; then
+        selected_port="${available_ports[0]}"
+    else
+        echo ""
+        echo "Detected USB UART devices:"
+        local idx=1
+        for p in "${available_ports[@]}"; do
+            echo "  [$idx] $p"
+            ((idx++))
+        done
+        read -r -p "Select port [1-${#available_ports[@]}]: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#available_ports[@]} )); then
+            selected_port="${available_ports[$((choice - 1))]}"
+        else
+            echo "Invalid selection."
+            return 0
+        fi
+    fi
+
+    echo ""
+    echo "Select Baud Rate:"
+    echo "  [1] 115200 (Standard Amlogic UART)"
+    echo "  [2] 921600 (High-speed / G12A / G12B / SM1)"
+    echo "  [3] 57600"
+    echo "  [4] 1500000"
+    echo "  [5] Custom baud rate"
+    read -r -p "Enter choice [1-5, default 1]: " choice
+    case "$choice" in
+        2) selected_baud="921600" ;;
+        3) selected_baud="57600" ;;
+        4) selected_baud="1500000" ;;
+        5)
+            read -r -p "Enter custom baud rate: " custom_baud
+            if [[ -n "$custom_baud" ]]; then
+                selected_baud="$custom_baud"
+            fi
+            ;;
+        *) selected_baud="115200" ;;
+    esac
+
+    read_uart "$selected_port" "$selected_baud"
+    read -r -p "Press Enter to continue..."
+}
+
+tui_mount_emmc() {
+    local choice
+    local dev_num=1
+    echo ""
+    echo "================ eMMC Storage (UMS) ================"
+    echo "  [1] eMMC (MMC 1 - Internal Storage)"
+    echo "  [2] SD Card (MMC 0 - External Slot)"
+    echo "  [3] Back"
+    echo "===================================================="
+    read -r -p "Enter choice [1-3, default 1]: " choice
+    case "$choice" in
+        1) dev_num=1 ;;
+        2) dev_num=0 ;;
+        3) return 0 ;;
+        *) dev_num=1 ;;
+    esac
+
+    mmc_dev="$dev_num"
+    action="mount_emmc"
+    if [[ -z "$target_img" && -z "$uboot_file" ]]; then
+        echo ""
+        echo "Note: If device is in MaskROM mode, an image or uboot file is needed to load U-Boot."
+        echo "If device is already running U-Boot, it will enter UMS immediately."
+        read -e -r -p "Enter image path (or leave empty if already in U-Boot): " input_path
+        if [[ -n "$input_path" ]]; then
+            input_path="${input_path/#\~/$HOME}"
+            if [[ -f "$input_path" ]]; then
+                target_img="$input_path"
+            fi
+        fi
+    fi
+
+    mount_emmc_storage "$mmc_dev"
+    read -r -p "Press Enter to continue..."
+}
+
+tui_bootloader_menu() {
+    local choice
+    local input_path
+    while true; do
+        echo ""
+        echo "================ Bootloader Management ================"
+        echo "  [1] Erase Bootloader"
+        echo "  [2] Re-flash Bootloader (Erase + Write Bootloader)"
+        echo "  [3] Set Partitions to Bootloader Only"
+        echo "  [4] Back"
+        echo "======================================================="
+        read -r -p "Enter choice [1-4]: " choice
+        case "$choice" in
+            1)
+                action="erase_bootloader"
+                erase_bootloader_action
+                read -r -p "Press Enter to continue..."
+                break
+                ;;
+            2)
+                action="reflash_bootloader"
+                if [[ -z "$target_img" && -z "$uboot_file" ]]; then
+                    echo ""
+                    read -e -r -p "Enter path to image (.img) or bootloader (.bin): " input_path
+                    if [[ -n "$input_path" ]]; then
+                        input_path="${input_path/#\~/$HOME}"
+                        if [[ -f "$input_path" ]]; then
+                            if [[ "$input_path" =~ \.img$ ]]; then
+                                target_img="$input_path"
+                            else
+                                uboot_file="$input_path"
+                            fi
+                        fi
+                    fi
+                fi
+                reflash_bootloader_action
+                read -r -p "Press Enter to continue..."
+                break
+                ;;
+            3)
+                parts="bootloader"
+                echo "Partitions set to 'bootloader'. Choose 'Start Flashing' to flash."
+                read -r -p "Press Enter to continue..."
+                break
+                ;;
+            4) break ;;
+            *) echo "Invalid selection." ;;
+        esac
+    done
+}
+
 run_tui() {
     local choice
     while true; do
@@ -320,17 +571,20 @@ run_tui() {
         echo "==============================================="
         echo "           Amlogic Flash Tool - TUI"
         echo "==============================================="
-        echo " [1] Image Package        : $img_display"
-        echo " [2] Target SoC / Board   : $soc_display"
-        echo " [3] Partitions to Flash  : $parts"
-        echo " [4] Wipe Data and Cache  : $wipe_str"
-        echo " [5] Reset Board After    : $reset_str"
-        echo " [6] Advanced Options     : (Bootloader, eFuse, Password, Destroy, Debug)"
-        echo " [7] Check Device Status"
-        echo " [8] Start Flashing"
-        echo " [9] Exit"
+        echo " [1]  Image Package         : $img_display"
+        echo " [2]  Target SoC / Board    : $soc_display"
+        echo " [3]  Partitions to Flash   : $parts"
+        echo " [4]  Wipe Data and Cache   : $wipe_str"
+        echo " [5]  Reset Board After     : $reset_str"
+        echo " [6]  Advanced Options      : (Bootloader, eFuse, Password, Destroy, Debug)"
+        echo " [7]  Check Device Status"
+        echo " [8]  Mount eMMC Storage (UMS)"
+        echo " [9]  Read UART from USB"
+        echo " [10] Erase / Re-flash Bootloader"
+        echo " [11] Start Flashing"
+        echo " [12] Exit"
         echo "==============================================="
-        read -r -p "Enter choice [1-9]: " choice
+        read -r -p "Enter choice [1-12]: " choice
         case "$choice" in
             1) tui_select_image ;;
             2) tui_select_soc ;;
@@ -347,20 +601,30 @@ run_tui() {
                 read -r -p "Press Enter to continue..."
                 ;;
             8)
+                tui_mount_emmc
+                ;;
+            9)
+                tui_uart_menu
+                ;;
+            10)
+                tui_bootloader_menu
+                ;;
+            11)
                 if [[ $destroy -eq 0 && -z "$target_img" ]]; then
                     echo "Please select an image package before flashing."
                     read -r -p "Press Enter to continue..."
                 else
+                    action="flash"
                     execute_flash
                     break
                 fi
                 ;;
-            9)
+            12)
                 echo "Exiting."
                 exit 0
                 ;;
             *)
-                echo "Invalid choice. Please enter a number between 1 and 9."
+                echo "Invalid choice. Please enter a number between 1 and 12."
                 ;;
         esac
     done
@@ -487,6 +751,27 @@ parse_args() {
         --destroy)
             destroy=1
             ;;
+        --erase-bootloader)
+            action="erase_bootloader"
+            ;;
+        --reflash-bootloader|--erase-reflash-bootloader)
+            action="reflash_bootloader"
+            ;;
+        --mount-emmc|--emmc-storage|--ums)
+            action="mount_emmc"
+            ;;
+        --mmc-dev)
+            mmc_dev="$optval"
+            ;;
+        --read-uart*|--uart*)
+            action="read_uart"
+            if [[ "$opt" =~ = ]]; then
+                uart_port="$optval"
+            fi
+            ;;
+        --baud)
+            uart_baud="$optval"
+            ;;
         --debug)
             debug=1
             ;;
@@ -505,7 +790,7 @@ execute_flash() {
     print_debug "SYSTEM = $SYSTEM"
     print_debug "EXE = $EXE"
 
-    if [[ -z "$destroy" || $destroy -eq 0 ]]; then
+    if [[ $destroy -eq 0 && "$action" == "flash" ]]; then
         if [[ -z "$target_img" ]]; then
             echo "Missing img argument"
             show_help
@@ -513,6 +798,26 @@ execute_flash() {
         fi
         if [[ -z "$parts" ]]; then
             parts="all"
+        fi
+    fi
+
+    if [[ "$action" == "reflash_bootloader" ]]; then
+        if [[ -z "$target_img" && -z "$uboot_file" ]]; then
+            echo "Missing image package or bootloader file for re-flashing bootloader."
+            echo "Use --img=path/to/image.img or --uboot-file=path/to/uboot.bin"
+            cleanup
+            exit 1
+        fi
+    fi
+
+    if [[ -z "$target_img" && -z "$uboot_file" ]]; then
+        if [[ "$action" == "mount_emmc" || "$action" == "erase_bootloader" ]]; then
+            if is_in_rom_mode; then
+                echo "Board is in MaskROM / USB update mode."
+                echo "An image package (--img) or bootloader file (--uboot-file) is required to initialize RAM U-Boot."
+                cleanup
+                exit 1
+            fi
         fi
     fi
 
@@ -564,25 +869,25 @@ execute_flash() {
         fi
         echo "[OK]"
 
-        platform_conf_name=$(awk '/sub_type=\"platform\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        platform_conf_name=$(awk '/sub_type="platform"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
         print_debug "platform_conf_name = $platform_conf_name"
-        ddr_filename=$(awk '/sub_type=\"DDR\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        ddr_filename=$(awk '/sub_type="DDR"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
         print_debug "ddr_filename = $ddr_filename"
-        uboot_filename=$(awk '/sub_type=\"UBOOT\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        uboot_filename=$(awk '/sub_type="UBOOT"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
         print_debug "uboot_filename = $uboot_filename"
-        uboot_comp_filename=$(awk '/sub_type=\"UBOOT_COMP\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        uboot_comp_filename=$(awk '/sub_type="UBOOT_COMP"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
         print_debug "uboot_comp_filename = $uboot_comp_filename"
-        dtb_meson_filename=$(awk '/sub_type=\"meson\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        dtb_meson_filename=$(awk '/sub_type="meson"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
         print_debug "dtb_meson_filename = $dtb_meson_filename"
-        dtb_meson1_filename=$(awk '/sub_type=\"meson1\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        dtb_meson1_filename=$(awk '/sub_type="meson1"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
         print_debug "dtb_meson1_filename = $dtb_meson1_filename"
-        dtb_meson1_enc_filename=$(awk '/sub_type=\"meson1_ENC\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        dtb_meson1_enc_filename=$(awk '/sub_type="meson1_ENC"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
         print_debug "dtb_meson1_enc_filename = $dtb_meson1_enc_filename"
-        ddr_enc_filename=$(awk '/sub_type=\"DDR_ENC\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        ddr_enc_filename=$(awk '/sub_type="DDR_ENC"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
         print_debug "ddr_enc_filename = $ddr_enc_filename"
-        uboot_enc_filename=$(awk '/sub_type=\"UBOOT_ENC\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        uboot_enc_filename=$(awk '/sub_type="UBOOT_ENC"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
         print_debug "uboot_enc_filename = $uboot_enc_filename"
-        keys_filename=$(awk '/sub_type=\"keys\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        keys_filename=$(awk '/sub_type="keys"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
         print_debug "keys_filename = $keys_filename"
 
         if [[ -n "$platform_conf_name" && -f "$tmp_dir/$platform_conf_name" ]]; then
@@ -650,9 +955,55 @@ execute_flash() {
         exit 1
     fi
 
+    if [[ "$action" == "erase_bootloader" && -z "$target_img" && -z "$uboot_file" ]]; then
+        if ! is_in_rom_mode; then
+            echo -n "Erasing bootloader "
+            run_update bulkcmd "bootloader_is_old"
+            run_update_assert bulkcmd "erase_bootloader"
+            run_update bulkcmd "store erase boot"
+            run_update bulkcmd "amlmmc erase bootloader"
+            run_update bulkcmd "mmc dev 1 1"
+            run_update bulkcmd "mmc erase 0 0x2000"
+            run_update bulkcmd "mmc dev 1 2"
+            run_update bulkcmd "mmc erase 0 0x2000"
+            run_update bulkcmd "mmc dev 1 0"
+            run_update bulkcmd "mmc erase 0 0x2000"
+            run_update bulkcmd "save"
+            echo "[OK]"
+            if [[ "$reset" =~ ^[yY]$ ]]; then
+                echo -n "Resetting board "
+                run_update bulkcmd "reset"
+                echo "[OK]"
+            fi
+            cleanup
+            exit 0
+        fi
+    fi
+
+    if [[ "$action" == "mount_emmc" && -z "$target_img" && -z "$uboot_file" ]]; then
+        if ! is_in_rom_mode; then
+            echo -n "Initializing MMC device $mmc_dev "
+            run_update_assert bulkcmd "mmc dev $mmc_dev"
+            echo "[OK]"
+            echo ""
+            echo "================ USB Mass Storage (UMS) ================"
+            echo "MMC device $mmc_dev is now exposed as a USB disk."
+            echo "You can view or mount its partitions from the host PC."
+            echo "Example host commands:"
+            echo "  lsblk"
+            echo "  sudo mount /dev/sdX1 /mnt"
+            echo "Press Ctrl+C to terminate storage mode."
+            echo "========================================================"
+            echo ""
+            run_update bulkcmd "ums 0 mmc $mmc_dev"
+            cleanup
+            exit 0
+        fi
+    fi
+
     run_update_return identify 7
     if [[ "$simu" != "1" ]]; then
-        if ! echo "$update_return" | grep -iq firmware; then
+        if ! echo "$update_return" | grep -iq firmware && ! lsusb 2>/dev/null | grep -iq "1b8e:c003"; then
             echo "Amlogic device not found"
             cleanup
             exit 1
@@ -685,7 +1036,7 @@ execute_flash() {
 
     local i
     if [[ "$parts" == "all" || "$parts" == "bootloader" || -z "$parts" || "$parts" == "none" ]]; then
-        if run_update bulkcmd "echo 12345"; then
+        if ! is_in_rom_mode; then
             echo -n "Rebooting the board "
             run_update bulkcmd "bootloader_is_old"
             run_update_assert bulkcmd "erase_bootloader"
@@ -791,12 +1142,16 @@ execute_flash() {
         fi
 
         if [[ -z "$bootloader_file" ]]; then
-            for ((i = 0; i < nb_partitions; i++)); do
-                if [[ "${partitions_name[$i]}" == "bootloader" ]]; then
-                    bootloader_file="$tmp_dir/${partitions_file[$i]}"
-                    break
-                fi
-            done
+            if [[ -n "$uboot_file" && -f "$uboot_file" ]]; then
+                bootloader_file="$uboot_file"
+            else
+                for ((i = 0; i < nb_partitions; i++)); do
+                    if [[ "${partitions_name[$i]}" == "bootloader" ]]; then
+                        bootloader_file="$tmp_dir/${partitions_file[$i]}"
+                        break
+                    fi
+                done
+            fi
         fi
 
         if [[ -z "$dtb_file" ]]; then
@@ -879,7 +1234,7 @@ execute_flash() {
                 sleep 1
             done
             run_update_return identify 7
-            if ! echo "$update_return" | grep -iq firmware; then
+            if ! echo "$update_return" | grep -iq firmware && ! lsusb 2>/dev/null | grep -iq "1b8e:c003"; then
                 echo "[KO]"
                 cleanup
                 exit 1
@@ -953,6 +1308,94 @@ execute_flash() {
         echo "[OK]"
 
         run_update bulkcmd "echo 12345"
+
+        if [[ "$action" == "mount_emmc" ]]; then
+            echo -n "Initializing MMC device $mmc_dev "
+            run_update_assert bulkcmd "mmc dev $mmc_dev"
+            echo "[OK]"
+            echo ""
+            echo "================ USB Mass Storage (UMS) ================"
+            echo "MMC device $mmc_dev is now exposed as a USB disk."
+            echo "You can view or mount its partitions from the host PC."
+            echo "Example host commands:"
+            echo "  lsblk"
+            echo "  sudo mount /dev/sdX1 /mnt"
+            echo "Press Ctrl+C to terminate storage mode."
+            echo "========================================================"
+            echo ""
+            run_update bulkcmd "ums 0 mmc $mmc_dev"
+            cleanup
+            exit 0
+        fi
+
+        if [[ "$action" == "erase_bootloader" ]]; then
+            echo -n "Erasing bootloader "
+            run_update bulkcmd "bootloader_is_old"
+            run_update_assert bulkcmd "erase_bootloader"
+            run_update bulkcmd "store erase boot"
+            run_update bulkcmd "amlmmc erase bootloader"
+            run_update bulkcmd "mmc dev 1 1"
+            run_update bulkcmd "mmc erase 0 0x2000"
+            run_update bulkcmd "mmc dev 1 2"
+            run_update bulkcmd "mmc erase 0 0x2000"
+            run_update bulkcmd "mmc dev 1 0"
+            run_update bulkcmd "mmc erase 0 0x2000"
+            run_update bulkcmd "save"
+            echo "[OK]"
+            if [[ "$reset" =~ ^[yY]$ ]]; then
+                echo -n "Resetting board "
+                run_update bulkcmd "reset"
+                echo "[OK]"
+            fi
+            cleanup
+            exit 0
+        fi
+
+        if [[ "$action" == "reflash_bootloader" ]]; then
+            echo -n "Erasing existing bootloader "
+            run_update bulkcmd "bootloader_is_old"
+            run_update_assert bulkcmd "erase_bootloader"
+            run_update bulkcmd "store erase boot"
+            run_update bulkcmd "amlmmc erase bootloader"
+            run_update bulkcmd "mmc dev 1 1"
+            run_update bulkcmd "mmc erase 0 0x2000"
+            run_update bulkcmd "mmc dev 1 2"
+            run_update bulkcmd "mmc erase 0 0x2000"
+            run_update bulkcmd "mmc dev 1 0"
+            run_update bulkcmd "mmc erase 0 0x2000"
+            echo "[OK]"
+
+            if [[ -n "$dtb_file" && -f "$dtb_file" ]]; then
+                run_update_assert mwrite "$dtb_file" mem dtb normal
+            fi
+
+            if [[ -z "$bootloader_file" || ! -f "$bootloader_file" ]]; then
+                if [[ -n "$uboot_file" && -f "$uboot_file" ]]; then
+                    bootloader_file="$uboot_file"
+                fi
+            fi
+
+            if [[ -z "$bootloader_file" || ! -f "$bootloader_file" ]]; then
+                echo "Bootloader file not found!"
+                cleanup
+                exit 1
+            fi
+
+            echo -n "Writing new bootloader "
+            run_update_assert partition bootloader "$bootloader_file"
+            echo "[OK]"
+
+            run_update bulkcmd "setenv upgrade_step 1"
+            run_update bulkcmd "save"
+
+            if [[ "$reset" =~ ^[yY]$ ]]; then
+                echo -n "Resetting board "
+                run_update bulkcmd "burn_complete 1"
+                echo "[OK]"
+            fi
+            cleanup
+            exit 0
+        fi
 
         if [[ "$soc" =~ ^(gxl|gxbb|gxm|axg|txlx|g12a|g12b|sm1)$ ]]; then
             if [[ $secured -eq 1 ]]; then
@@ -1131,6 +1574,14 @@ parse_args "$@"
 
 if [[ $tui -eq 1 ]]; then
     run_tui
+elif [[ "$action" == "read_uart" ]]; then
+    read_uart "$uart_port" "$uart_baud"
+elif [[ "$action" == "mount_emmc" ]]; then
+    mount_emmc_storage "$mmc_dev"
+elif [[ "$action" == "erase_bootloader" ]]; then
+    erase_bootloader_action
+elif [[ "$action" == "reflash_bootloader" ]]; then
+    reflash_bootloader_action
 else
     execute_flash
 fi
