@@ -1,838 +1,1136 @@
 #!/bin/bash
-#----------
-target_img=
-parts=
-wipe=
-reset=
-soc=
-uboot_file=
-efuse_file=
-password=
-destroy=
-update_return=
+
+set -e -o pipefail
+
+target_img=""
+parts="all"
+wipe=1
+reset="y"
+soc=""
+uboot_file=""
+efuse_file=""
+password=""
+destroy=0
+update_return=""
 debug=0
 simu=0
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-RESET='\033[m'
-TOOL_PATH="$(dirname $(readlink -fm $(which $0)))"
-SYSTEM='linux-x86'
-EXE=
+tui=0
+TOOL_PATH="$(dirname "$(readlink -fm "$0")")"
+SYSTEM="linux-x86"
+EXE=""
+tmp_dir=""
 
-# Helper
-# ------
-show_help()
-{
-    echo "Usage      : $0 path/to/aml_upgrade_package.img"
+show_help() {
+    echo "Usage: $0 [options] [path/to/aml_upgrade_package.img]"
+    echo "Supported SoC Families:"
+    echo "  gxl   : S905X, S905D, S905W, S905L, S805X (p212, p281, p271, B860H, HG680P, etc.)"
+    echo "  gxbb  : S905, S905H (p200, p201, Odroid C2, etc.)"
+    echo "  gxm   : S912 (q200, q201, Khadas VIM2, etc.)"
+    echo "  g12a  : S905X2, S905Y2, S905D2 (Radxa Zero, Khadas VIM3L, SEI510, etc.)"
+    echo "  g12b  : S922X, A311D (Khadas VIM3, Odroid N2/N2+, Radxa Zero 2, etc.)"
+    echo "  sm1   : S905X3, S905D3, S905Y3 (SEI610, X96 Max+, etc.)"
+    echo "  axg   : A113D, A113X (s400, s410, etc.)"
+    echo "  txlx  : T962, T962E, T962X"
+    echo "  m8    : S802, S805, S812 (Meson8, Meson8b)"
+    echo "Options:"
+    echo "  --tui, -i                     Launch interactive text user interface"
+    echo "  --board=<name>                Target board/device (e.g. p212, b860h, hg680p, radxa-zero)"
+    echo "  --soc=<family>                Target SoC family (gxl, gxbb, gxm, g12a, g12b, sm1, axg, txlx, m8)"
+    echo "  --img=path/to/image.img        Upgrade image package"
+    echo "  --parts=<all|bootloader|...>   Partitions to flash (default: all)"
+    echo "  --wipe                         Wipe data and cache partitions (default: 1)"
+    echo "  --no-wipe                      Do not wipe data and cache partitions"
+    echo "  --reset=<y|n>                  Reset board after burning (default: y)"
+    echo "  --uboot-file=path/to/uboot     Override bootloader file"
+    echo "  --efuse-file=path/to/efuse     Program eFuse file"
+    echo "  --password=path/to/password    Password file for locked USB mode"
+    echo "  --destroy                      Erase bootloader and reset board"
+    echo "  --debug                        Enable debug messages"
+    echo "  --help, -h                     Display this help message"
 }
 
-# Check if a given file exists and exit if not
-# --------------------------------------------
-check_file()
-{
+check_file() {
     if [[ "$simu" != "1" ]]; then
-       if [[ ! -f $1 ]]; then
-          echo "$1 not found"
-          cleanup
-          exit 1
-       fi
+        if [[ ! -f "$1" ]]; then
+            echo "$1 not found"
+            cleanup
+            exit 1
+        fi
     fi
 }
 
-# Trap called on Ctrl-C
-# ---------------------
-cleanup()
-{
-    echo -e $RESET
+cleanup() {
     print_debug "Cleanup"
-    [[ -d $tmp_dir ]] && rm -rf "$tmp_dir"
+    if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
+        rm -rf "$tmp_dir"
+    fi
 }
-cleanup_trap()
-{
+
+cleanup_trap() {
     cleanup
     exit 1
 }
 
-# Print debug function
-# --------------------
-print_debug()
-{
-   if [[ $debug == 1 ]]; then
-      echo -e $YELLOW"$1"$RESET
-   fi
+print_debug() {
+    if [[ $debug -eq 1 ]]; then
+        echo "$1"
+    fi
 }
 
-# Wrapper for the Amlogic 'update' command
-# ----------------------------------------
-run_update_return()
-{
+detect_system() {
+    local host_os
+    local host_machine
+    host_os=$(uname -s)
+    host_machine=$(uname -m)
+
+    if [[ "$host_os" == "Linux" ]]; then
+        if [[ "$host_machine" =~ x86_64|i[3-6]86 ]]; then
+            SYSTEM="linux-x86"
+            EXE=""
+        else
+            SYSTEM="linux-arm"
+            EXE=""
+        fi
+    else
+        SYSTEM="windows"
+        EXE=".exe"
+    fi
+}
+
+run_update_return() {
     local cmd
     local need_spaces
+    local arg
 
     cmd="$TOOL_PATH/tools/$SYSTEM/update$EXE 2>/dev/null"
     need_spaces=0
-    if [[ "$1" == "bulkcmd" ]] || [[ "$1" == "tplcmd" ]]; then
-       need_spaces=1
+    if [[ "$1" == "bulkcmd" || "$1" == "tplcmd" ]]; then
+        need_spaces=1
     fi
     cmd+=" $1"
     shift 1
 
     for arg in "$@"; do
-        if [[ "$arg" =~ ' ' ]]; then
-           cmd+=" \"     $arg\""
+        if [[ "$arg" =~ [[:space:]] ]]; then
+            cmd+=" \"     $arg\""
         else
-           if [[ $need_spaces == 1 ]]; then
-              cmd+=" \"     $arg\""
-           else
-              cmd+=" $arg"
-           fi
+            if [[ $need_spaces -eq 1 ]]; then
+                cmd+=" \"     $arg\""
+            else
+                cmd+=" $arg"
+            fi
         fi
     done
 
     update_return=""
-    print_debug "\nCommand ->$CYAN $cmd $RESET"
+    print_debug "Command -> $cmd"
     if [[ "$simu" != "1" ]]; then
-       update_return=`eval "$cmd"`
+        update_return=$(eval "$cmd")
     fi
     print_debug "- Results ---------------------------------------------------"
-    print_debug "$RED $update_return $RESET"
+    print_debug "$update_return"
     print_debug "-------------------------------------------------------------"
-    print_debug ""
     return 0
 }
 
-# Wrapper to the Amlogic 'update' command
-# ---------------------------------------
-run_update()
-{
-    local cmd
+run_update() {
     local ret=0
-
     run_update_return "$@"
-
-    if `echo $update_return | grep -q "ERR"`; then
-       ret=1
+    if echo "$update_return" | grep -q "ERR"; then
+        ret=1
     fi
-
     return $ret
 }
 
-# Assert update wrapper
-# ---------------------
-run_update_assert()
-{
-    run_update "$@"
-    if [[ $? != 0 ]]; then
-       echo -e $RED"[KO]"
-       cleanup
-       exit 1
+run_update_assert() {
+    if ! run_update "$@"; then
+        echo "[KO]"
+        cleanup
+        exit 1
     fi
 }
 
-# Parse options
-# -------------
-for opt do
-    optval="${opt#*=}"
-    case "${opt%=*}" in
-    --help|-h)
-        show_help $(basename $0)
-        exit 0
-        ;;
-    --img)
-        target_img="$optval"
-        check_file $target_img
-        ;;
-    --debug)
-        debug=1
-        ;;
-    *)
-        target_img="$optval"
-        check_file $target_img
-        ;;
-    esac
-    parts=all
-    soc="g12a"
-    wipe=1
-    reset="y"
-    destroy=0
-done
+check_device_status() {
+    detect_system
+    local status_output
+    status_output=$("$TOOL_PATH/tools/$SYSTEM/update$EXE" identify 7 2>&1 || true)
+    echo ""
+    echo "================ Device Status ================"
+    if echo "$status_output" | grep -iq "firmware"; then
+        echo "Status: Connected (Amlogic device detected in USB/MaskROM mode)"
+        echo "Identification: $status_output"
+    else
+        echo "Status: Not detected"
+        echo "Make sure the board is connected via USB OTG in MaskROM or update mode."
+    fi
+    echo "==============================================="
+    echo ""
+}
 
-# Testing host machine
-# --------------------
-host_os=`uname -a|grep Linux`
-host_machine=`uname -a|grep -i "x86"`
-if [ ! -z "$host_os" ]; then
-   if [ ! -z "$host_machine" ]; then
-      SYSTEM='linux-x86'
-      EXE=''
-   else
-     SYSTEM='linux-arm'
-     EXE=''
-   fi
-else
-   SYSTEM='windows'
-   EXE='.exe'
-fi
-print_debug "host_os      = $host_os"
-print_debug "host_machine = $host_machine"
-print_debug "SYSTEM       = $SYSTEM"
-print_debug "EXE          = $EXE"
+tui_select_image() {
+    local input_path
+    echo ""
+    echo "Enter path to Amlogic upgrade package (.img):"
+    read -e -r -p "> " input_path
+    if [[ -n "$input_path" ]]; then
+        input_path="${input_path/#\~/$HOME}"
+        if [[ -f "$input_path" ]]; then
+            target_img="$input_path"
+            echo "Selected image: $target_img"
+        else
+            echo "File not found: $input_path"
+        fi
+    fi
+}
 
-# Check parameters
-# ----------------
-if [[ -z $destroy ]]; then
-   if [[ -z $target_img ]]; then
-      echo "Missing img argument"
-      show_help
-      exit 1
-   fi
-   if [[ -z $parts ]]; then
-      echo "Missing --parts argument"
-      exit 1
-   fi
-fi
-if [[ -z $soc ]]; then
-   soc=gxl
-fi
-if [[ "$soc" != "m8" ]] && [[ "$soc" != "gxl" ]] && [[ "$soc" != "axg" ]] && [[ "$soc" != "txlx" ]] && [[ "$soc" != "g12a" ]]; then
-   echo "Soc type is invalid, should be either m8,gxl,axg,txlx,g12a"
-   exit 1
-fi
-run_update_return identify 7
-if [[ "$simu" != "1" ]]; then
-   if ! `echo $update_return | grep -iq firmware`; then
-      echo "Amlogic device not found"
-      exit 1
-   fi
-fi
+tui_select_soc() {
+    local choice
+    local custom_val
+    while true; do
+        echo ""
+        echo "Select SoC Family or Board:"
+        echo "  [1] Auto-detect from image"
+        echo "  [2] GXL   (S905X, S905D, S905W, S905L, S805X, P212, B860H, HG680P)"
+        echo "  [3] GXBB  (S905, S905H, P200, P201, Odroid C2)"
+        echo "  [4] GXM   (S912, Q200, Q201, Khadas VIM2)"
+        echo "  [5] G12A  (S905X2, S905Y2, S905D2, Radxa Zero, VIM3L, SEI510)"
+        echo "  [6] G12B  (S922X, A311D, Khadas VIM3, Odroid N2/N2+, Radxa Zero 2)"
+        echo "  [7] SM1   (S905X3, S905D3, S905Y3, SEI610, X96 Max+)"
+        echo "  [8] AXG   (A113D, A113X, S400, S410)"
+        echo "  [9] TXLX  (T962, T962E, T962X)"
+        echo "  [10] M8   (S802, S805, S812, Meson8, Meson8b)"
+        echo "  [11] Custom Board/SoC string"
+        echo "  [12] Back"
+        read -r -p "Enter choice [1-12]: " choice
+        case "$choice" in
+            1) soc=""; break ;;
+            2) soc="gxl"; break ;;
+            3) soc="gxbb"; break ;;
+            4) soc="gxm"; break ;;
+            5) soc="g12a"; break ;;
+            6) soc="g12b"; break ;;
+            7) soc="sm1"; break ;;
+            8) soc="axg"; break ;;
+            9) soc="txlx"; break ;;
+            10) soc="m8"; break ;;
+            11)
+                read -r -p "Enter board/SoC name: " custom_val
+                soc="$custom_val"
+                break
+                ;;
+            12) break ;;
+            *) echo "Invalid selection." ;;
+        esac
+    done
+}
 
-# Set trap
-# --------
-trap cleanup_trap SIGHUP SIGINT SIGTERM
+tui_select_parts() {
+    local choice
+    local custom_part
+    while true; do
+        echo ""
+        echo "Select Partitions to Flash:"
+        echo "  [1] All partitions (default)"
+        echo "  [2] Bootloader only"
+        echo "  [3] Device Tree (dtb) only"
+        echo "  [4] Recovery only"
+        echo "  [5] System only"
+        echo "  [6] Boot only"
+        echo "  [7] None (Load U-Boot into RAM only)"
+        echo "  [8] Custom partition name"
+        echo "  [9] Back"
+        read -r -p "Enter choice [1-9]: " choice
+        case "$choice" in
+            1) parts="all"; break ;;
+            2) parts="bootloader"; break ;;
+            3) parts="dtb"; break ;;
+            4) parts="recovery"; break ;;
+            5) parts="system"; break ;;
+            6) parts="boot"; break ;;
+            7) parts="none"; break ;;
+            8)
+                read -r -p "Enter partition name: " custom_part
+                parts="$custom_part"
+                break
+                ;;
+            9) break ;;
+            *) echo "Invalid selection." ;;
+        esac
+    done
+}
 
-# Check if the board is locked with a password
-# --------------------------------------------
-need_password=0
-run_update_return identify 7
-if `echo $update_return | grep -iq "Password check NG"`; then
-   need_password=1
-fi
-if [[ $need_password == 1 ]]; then
-   if [[ -z $password ]]; then
-     echo "The board is locked with a password, please provide a password using --password option !"
-     exit 1
-   fi
-fi
+tui_advanced_options() {
+    local choice
+    local input_val
+    while true; do
+        local destroy_str="No"
+        local debug_str="Disabled"
+        if [[ $destroy -eq 1 ]]; then destroy_str="Yes"; fi
+        if [[ $debug -eq 1 ]]; then debug_str="Enabled"; fi
 
-# Unlock usb mode by password
-# ---------------------------
-if [[ $need_password == 1 ]]; then
-   if [[ $password != "" ]]; then
-      echo -n "Unlocking usb interface "
-      run_update_assert password $password
-      run_update_return identify 7
-      if `echo $update_return | grep -iq "Password check OK"`; then
-         echo -e $GREEN"[OK]"$RESET
-      else
-         echo -e $RED"[KO]"$RESET
-         echo "It seems you provided an incorrect password !"
-         exit 1
-      fi
-   fi
-fi
+        echo ""
+        echo "================ Advanced Options ================"
+        echo "  [1] Custom Bootloader File : [${uboot_file:-None}]"
+        echo "  [2] Custom eFuse File      : [${efuse_file:-None}]"
+        echo "  [3] Password File          : [${password:-None}]"
+        echo "  [4] Toggle Destroy Mode    : [$destroy_str]"
+        echo "  [5] Toggle Debug Mode      : [$debug_str]"
+        echo "  [6] Back"
+        echo "=================================================="
+        read -r -p "Enter choice [1-6]: " choice
+        case "$choice" in
+            1)
+                read -e -r -p "Enter bootloader path (leave empty to clear): " input_val
+                input_val="${input_val/#\~/$HOME}"
+                uboot_file="$input_val"
+                ;;
+            2)
+                read -e -r -p "Enter efuse file path (leave empty to clear): " input_val
+                input_val="${input_val/#\~/$HOME}"
+                efuse_file="$input_val"
+                ;;
+            3)
+                read -e -r -p "Enter password file path (leave empty to clear): " input_val
+                input_val="${input_val/#\~/$HOME}"
+                password="$input_val"
+                ;;
+            4)
+                if [[ $destroy -eq 1 ]]; then destroy=0; else destroy=1; fi
+                ;;
+            5)
+                if [[ $debug -eq 1 ]]; then debug=0; else debug=1; fi
+                ;;
+            6) break ;;
+            *) echo "Invalid selection." ;;
+        esac
+    done
+}
 
-# Create tmp directory
-# --------------------
-if [[ "$SYSTEM" == "windows" ]]; then
-   tmp_dir="C:/tmp/aml-flash-tool"`date +%H%M%S`
-   mkdir -p $tmp_dir
-else
-   tmp_dir=$(mktemp -d /tmp/aml-flash-tool-XXXX)
-fi
+run_tui() {
+    local choice
+    while true; do
+        local wipe_str="Yes"
+        local reset_str="Yes"
+        if [[ $wipe -eq 0 ]]; then wipe_str="No"; fi
+        if [[ "$reset" == "n" || "$reset" == "N" ]]; then reset_str="No"; fi
+        local soc_display="${soc:-Auto-detect}"
+        local img_display="${target_img:-<Not selected>}"
 
-# Should we destroy the boot ?
-# ----------------------------
-if [[ "$parts" == "all" ]] || [[ "$parts" == "bootloader" ]] || [[ "$parts" == "" ]] || [[ "$parts" == "none" ]]; then
-   run_update bulkcmd "echo 12345"
-   #run_update bulkcmd "low_power"
-   if [[ $? = 0 ]]; then
-      echo -n "Rebooting the board "
-      run_update bulkcmd "bootloader_is_old"
-      # Actually this command don't really erase the bootloader, it reboot to prepare update
-      run_update_assert bulkcmd "erase_bootloader"
-      if [[ $destroy == 1 ]]; then
-        run_update bulkcmd "store erase boot"
-        run_update bulkcmd "amlmmc erase 1"
-        run_update bulkcmd "nand erase 0 4096"
-      fi
-      run_update bulkcmd "reset"
-      if [[ $destroy == 1 ]]; then
-        echo -e $GREEN"[OK]"$RESET
-        cleanup
-        exit 0
-      fi
-      for i in {1..8}
-         do
-         echo -n "."
-         sleep 1
-      done
-      echo -e $GREEN"[OK]"$RESET
-   else
-     if [[ $destroy == 1 ]]; then
-        echo "Seems board is already in usb mode, nothing to do more..."
-        cleanup
-        exit 0
-     fi
-   fi
-fi
-if [[ $destroy == 1 ]]; then
-   cleanup
-   exit 0
-fi
+        echo ""
+        echo "==============================================="
+        echo "           Amlogic Flash Tool - TUI"
+        echo "==============================================="
+        echo " [1] Image Package        : $img_display"
+        echo " [2] Target SoC / Board   : $soc_display"
+        echo " [3] Partitions to Flash  : $parts"
+        echo " [4] Wipe Data and Cache  : $wipe_str"
+        echo " [5] Reset Board After    : $reset_str"
+        echo " [6] Advanced Options     : (Bootloader, eFuse, Password, Destroy, Debug)"
+        echo " [7] Check Device Status"
+        echo " [8] Start Flashing"
+        echo " [9] Exit"
+        echo "==============================================="
+        read -r -p "Enter choice [1-9]: " choice
+        case "$choice" in
+            1) tui_select_image ;;
+            2) tui_select_soc ;;
+            3) tui_select_parts ;;
+            4)
+                if [[ $wipe -eq 1 ]]; then wipe=0; else wipe=1; fi
+                ;;
+            5)
+                if [[ "$reset" == "y" || "$reset" == "Y" ]]; then reset="n"; else reset="y"; fi
+                ;;
+            6) tui_advanced_options ;;
+            7)
+                check_device_status
+                read -r -p "Press Enter to continue..."
+                ;;
+            8)
+                if [[ $destroy -eq 0 && -z "$target_img" ]]; then
+                    echo "Please select an image package before flashing."
+                    read -r -p "Press Enter to continue..."
+                else
+                    execute_flash
+                    break
+                fi
+                ;;
+            9)
+                echo "Exiting."
+                exit 0
+                ;;
+            *)
+                echo "Invalid choice. Please enter a number between 1 and 9."
+                ;;
+        esac
+    done
+}
 
-# Unlock usb mode by password
-# ---------------------------
-# If we started with usb mode from uboot, the password is already unlocked
-# But just after we reset the board, then fall into rom mode
-# That's why we need to recheck password lock a second time
-need_password=0
-run_update_return identify 7
-if `echo $update_return | grep -iq "Password check NG"`; then
-   need_password=1
-fi
-if [[ $need_password == 1 ]]; then
-   if [[ -z $password ]]; then
-      echo "The board is locked with a password, please provide a password using --password option !"
-      cleanup
-      exit 1
-   fi
-fi
-if [[ $need_password == 1 ]]; then
-   if [[ $password != "" ]]; then
-      echo -n "Unlocking usb interface "
-      run_update_assert password $password
-      run_update_return identify 7
-      if `echo $update_return | grep -iq "Password check OK"`; then
-         echo -e $GREEN"[OK]"$RESET
-      else
-         echo -e $RED"[KO]"$RESET
-         echo "It seems you provided an incorrect password !"
-         cleanup
-         exit 1
-      fi
-   fi
-fi
+parse_args() {
+    if [[ $# -eq 0 ]]; then
+        if [ -t 0 ]; then
+            tui=1
+            return 0
+        else
+            show_help
+            exit 1
+        fi
+    fi
 
-# Read chip id
-# ------------
-#if [[ "$soc" == "auto" ]]; then
-#  echo -n "Identify chipset type "
-#  value=`$TOOL_PATH/tools/update chipid|grep ChipID|cut -d ':' -f2|xxd -r -p|cut -c1-6`
-#  echo $value
-#  if [[ "$value" == "AMLGXL" ]]; then
-#     soc=gxl
-#  fi
-#  if [[ "$value" == "AMLAXG" ]]; then
-#     soc=axg
-#  fi
-#  if [[ "$soc" != "gxl" ]] && [[ "$soc" != "txlx" ]] && [ "$soc" != "g12a" ]] && [[ "$soc" != "axg" ]] && [[ "$soc" != "m8" ]]; then
-#     echo -e $RED"[KO]"$RESET
-#     echo "Unable to identify chipset, Try by forcing it manually with --soc=<gxl,axg,txlx,g12a,m8>"
-#     cleanup
-#     exit 1
-#  else
-#     echo -e $GREEN"["$value"]"$RESET
-#  fi
-#fi
+    local opt
+    local optval
+    local soc_val
+    local board_val
 
-# Check if board is secure
-# ------------------------
-secured=0
-value=0
-# Board secure info is extracted from SEC_AO_SEC_SD_CFG10 register
-if [[ "$soc" == "gxl" ]]; then
-   run_update_return rreg 4 0xc8100228
-   value=0x`echo $update_return|grep -i c8100228|awk -F: '{gsub(/ /,"",$2);print $2}'`
-   print_debug "0xc8100228      = $value"
-   value=$(($value & 0x10))
-   print_debug "Secure boot bit = $value"
-fi
-if [[ "$soc" == "axg" ]] || [[ $soc == "txlx" ]] || [[ $soc == "g12a" ]]; then
-   run_update_return rreg 4 0xff800228
-   value=0x`echo $update_return|grep -i ff800228|awk -F: '{gsub(/ /,"",$2);print $2}'`
-   print_debug "0xff800228      = $value"
-   value=$(($value & 0x10))
-   print_debug "Secure boot bit = $value"
-fi
-if [[ "$soc" == "m8" ]]; then
-   run_update_return rreg 4 0xd9018048
-   value=0x`echo $update_return|grep -i d9018048|awk -F: '{gsub(/ /,"",$2);print $2}'`
-   print_debug "0xd9018048      = $value"
-   value=$(($value & 0x80))
-   print_debug "Secure boot bit = $value"
-fi
-if [[ $value != 0 ]]; then
-   secured=1
-   echo "Board is in secure mode"
-fi
+    for opt do
+        optval="${opt#*=}"
+        case "${opt%=*}" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --tui|-i|--interactive|--menu)
+            tui=1
+            ;;
+        --img)
+            target_img="$optval"
+            check_file "$target_img"
+            ;;
+        --soc)
+            soc_val=$(echo "$optval" | tr '[:upper:]' '[:lower:]')
+            case "$soc_val" in
+            s905x|s905d|s905w|s905l|s805x|gxl)
+                soc="gxl"
+                ;;
+            s905|gxbb)
+                soc="gxbb"
+                ;;
+            s912|gxm)
+                soc="gxm"
+                ;;
+            s905x2|s905y2|s905d2|g12a)
+                soc="g12a"
+                ;;
+            s922x|a311d|g12b)
+                soc="g12b"
+                ;;
+            s905x3|s905d3|s905y3|sm1)
+                soc="sm1"
+                ;;
+            a113*|axg)
+                soc="axg"
+                ;;
+            t962*|txlx)
+                soc="txlx"
+                ;;
+            s805|s802|s812|m8|meson8|meson8b)
+                soc="m8"
+                ;;
+            *)
+                soc="$optval"
+                ;;
+            esac
+            ;;
+        --board)
+            board_val=$(echo "$optval" | tr '[:upper:]' '[:lower:]')
+            case "$board_val" in
+            p212|b860h*|hg680*|hg860*|lepotato|vim1|a95x|tx3|x96|p281|x96-mini|tx3-mini|p271)
+                soc="gxl"
+                ;;
+            p200|p201|odroid-c2)
+                soc="gxbb"
+                ;;
+            q200|q201|vim2|gt1*)
+                soc="gxm"
+                ;;
+            radxa-zero|vim3l|sei510|u200)
+                soc="g12a"
+                ;;
+            vim3|odroid-n2*|radxa-zero2|gt-king*)
+                soc="g12b"
+                ;;
+            sei610|x96-max*|tx3-bz)
+                soc="sm1"
+                ;;
+            s400|s410)
+                soc="axg"
+                ;;
+            *)
+                soc="$optval"
+                ;;
+            esac
+            ;;
+        --parts)
+            parts="$optval"
+            ;;
+        --wipe)
+            wipe=1
+            ;;
+        --no-wipe)
+            wipe=0
+            ;;
+        --reset)
+            reset="$optval"
+            ;;
+        --uboot-file)
+            uboot_file="$optval"
+            check_file "$uboot_file"
+            ;;
+        --efuse-file)
+            efuse_file="$optval"
+            check_file "$efuse_file"
+            ;;
+        --password)
+            password="$optval"
+            check_file "$password"
+            ;;
+        --destroy)
+            destroy=1
+            ;;
+        --debug)
+            debug=1
+            ;;
+        *)
+            if [[ "$opt" != -* ]]; then
+                target_img="$opt"
+                check_file "$target_img"
+            fi
+            ;;
+        esac
+    done
+}
 
-# Unpack image if image is given
-# ------------------------------
-echo -n "Unpacking image "
-return_value=`$TOOL_PATH/tools/$SYSTEM/aml_image_v2_packer$EXE -d $target_img $tmp_dir`
-print_debug "\n$return_value"
-if [[ -z `echo $return_value|grep "Image unpack OK!"` ]]; then
-   echo -e $RED"[KO]"$RESET
-   cleanup
-   exit 1
-fi
-echo -e $GREEN"[OK]"$RESET
-print_debug ""
-print_debug "Parsing image configuration files"
-print_debug "---------------------------------"
-platform_conf_name=`awk '/sub_type=\"platform\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg`
-print_debug "platform_conf_name  = $platform_conf_name"
-ddr_filename=`awk '/sub_type=\"DDR\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg`
-print_debug "ddr_filename        = $ddr_filename"
-uboot_filename=`awk '/sub_type=\"UBOOT\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg`
-print_debug "uboot_filename      = $uboot_filename"
-uboot_comp_filename=`awk '/sub_type=\"UBOOT_COMP\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg`
-print_debug "uboot_comp_filename = $uboot_comp_filename"
-dtb_meson_filename=`awk '/sub_type=\"meson\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg`
-print_debug "dtb_meson_filename  = $dtb_meson_filename"
-dtb_meson1_filename=`awk '/sub_type=\"meson1\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg`
-print_debug "dtb_meson1_filename = $dtb_meson1_filename"
-dtb_meson1_enc_filename=`awk '/sub_type=\"meson1_ENC\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg`
-print_debug "dtb_meson1_enc_filename = $dtb_meson1_enc_filename"
-ddr_enc_filename=`awk '/sub_type=\"DDR_ENC\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg`
-print_debug "ddr_enc_filename    = $ddr_enc_filename"
-uboot_enc_filename=`awk '/sub_type=\"UBOOT_ENC\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg`
-print_debug "uboot_enc_filename  = $uboot_enc_filename"
-keys_filename=`awk '/sub_type=\"keys\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg`
-print_debug "keys_filename       = $keys_filename"
-platform=`awk '/Platform:/{gsub("Platform:","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "platform            = $platform"
-bin_params=`awk '/BinPara:/{gsub("BinPara:","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "bin_params          = $bin_params"
-ddr_load=`awk '/DDRLoad:/{gsub("DDRLoad:","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "ddr_load            = $ddr_load"
-ddr_run=`awk '/DDRRun:/{gsub("DDRRun:","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "ddr_run             = $ddr_run"
-uboot_down=`awk '/Uboot_down:/{gsub("Uboot_down:","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "uboot_down          = $uboot_down"
-uboot_decomp=`awk '/Uboot_decomp:/{gsub("Uboot_decomp:","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "uboot_decomp        = $uboot_decomp"
-uboot_enc_down=`awk '/Uboot_enc_down:/{gsub("Uboot_enc_down:","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "uboot_enc_down      = $uboot_enc_down"
-uboot_enc_run=`awk '/Uboot_enc_run:/{gsub("Uboot_enc_run:","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "uboot_enc_run       = $uboot_enc_run"
-uboot_load=`awk '/UbootLoad:/{gsub("UbootLoad:","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "uboot_load          = $uboot_load"
-uboot_run=`awk '/UbootRun:/{gsub("UbootRun:","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "uboot_run           = $uboot_run"
-bl2_params=`awk '/bl2ParaAddr=/{gsub("bl2ParaAddr=","",$1); print $1}' $tmp_dir/$platform_conf_name`
-print_debug "bl2_params          = $bl2_params"
-nb_partitions=`awk '/main_type=\"PARTITION\"/{print}' $tmp_dir/image.cfg|wc -l`
-print_debug "nb_partitions       = $nb_partitions"
-partitions_file=( `awk '/main_type=\"PARTITION\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' $tmp_dir/image.cfg | xargs` )
-partitions_name=( `awk '/main_type=\"PARTITION\"/{gsub("sub_type=","",$3); gsub(/"/,"",$3); print $3}' $tmp_dir/image.cfg | xargs` )
-partitions_type=( `awk '/main_type=\"PARTITION\"/{gsub("file_type=","",$4); gsub(/"/,"",$4); print $4}' $tmp_dir/image.cfg | xargs` )
-print_debug ""
-print_debug "Partition list"
-print_debug "--------------"
-for i in $(seq 0 `expr $nb_partitions - 1`)
-do
-  print_debug "$i ${partitions_file[$i]} ${partitions_name[$i]} ${partitions_type[$i]}" 
-done
-print_debug ""
+execute_flash() {
+    detect_system
+    print_debug "SYSTEM = $SYSTEM"
+    print_debug "EXE = $EXE"
 
-# Bootloader update
-# -----------------
-if [[ "$parts" == "all" ]] || [[ "$parts" == "bootloader" ]] || [[ "$parts" == "none" ]]; then
-   if [[ $soc == "gxl" ]] || [[ $soc == "axg" ]] || [[ $soc == "txlx" ]]; then
-      ddr=$TOOL_PATH/tools/datas/usbbl2runpara_ddrinit.bin
-      fip=$TOOL_PATH/tools/datas/usbbl2runpara_runfipimg.bin
-      check_file $ddr
-      check_file $fip
-      fi
-   if [[ $soc == "m8" ]]; then
-      fip=$TOOL_PATH/tools/datas/decompressPara_4M.dump
-      check_file $fip
-   fi
+    if [[ -z "$destroy" || $destroy -eq 0 ]]; then
+        if [[ -z "$target_img" ]]; then
+            echo "Missing img argument"
+            show_help
+            exit 1
+        fi
+        if [[ -z "$parts" ]]; then
+            parts="all"
+        fi
+    fi
 
-   if [[ -z $bootloader_file ]]; then
-      for i in $(seq 0 `expr $nb_partitions - 1`)
-      do
-      if [[ "${partitions_name[$i]}" == "bootloader" ]]; then
-         bootloader_file=$tmp_dir/${partitions_file[$i]}
-         break
-      fi
-      done
-   fi
-   if [[ -z $dtb_file ]]; then
-      if [[ $soc == "gxl" ]] || [[ $soc == "axg" ]] || [[ $soc == "txlx" ]] || [[ $soc == "g12a" ]]; then
-         for i in $(seq 0 `expr $nb_partitions - 1`)
-         do
-         if [[ "${partitions_name[$i]}" == "_aml_dtb" ]]; then
-            dtb_file=$tmp_dir/${partitions_file[$i]}
-            break
-         fi
-         done
-      fi
-      if [[ $soc == "m8" ]]; then
-         dtb_file=$tmp_dir/$dtb_meson_filename
-      fi
-   fi
+    trap cleanup_trap SIGHUP SIGINT SIGTERM
 
-   print_debug "Bootloader/DTB files"
-   print_debug "--------------------"
-   print_debug "bootloader_file = $bootloader_file"
-   print_debug "dtb_file        = $dtb_file"
+    if [[ "$SYSTEM" == "windows" ]]; then
+        tmp_dir="C:/tmp/aml-flash-tool$(date +%H%M%S)"
+        mkdir -p "$tmp_dir"
+    else
+        tmp_dir=$(mktemp -d /tmp/aml-flash-tool-XXXX)
+    fi
 
-   check_file "$bootloader_file"
-   check_file "$dtb_file"
+    local platform_conf_name=""
+    local ddr_filename=""
+    local uboot_filename=""
+    local uboot_comp_filename=""
+    local dtb_meson_filename=""
+    local dtb_meson1_filename=""
+    local dtb_meson1_enc_filename=""
+    local ddr_enc_filename=""
+    local uboot_enc_filename=""
+    local keys_filename=""
+    local platform=""
+    local bin_params=""
+    local ddr_load=""
+    local ddr_run=""
+    local uboot_down=""
+    local uboot_decomp=""
+    local uboot_enc_down=""
+    local uboot_enc_run=""
+    local uboot_load=""
+    local uboot_run=""
+    local bl2_params=""
+    local nb_partitions=0
+    local partitions_file=()
+    local partitions_name=()
+    local partitions_type=()
+    local detected_platform=""
 
-   if [[ -z $uboot_file ]]; then
-      if [[ $secured == 0 ]]; then
-         bl2=$tmp_dir/$ddr_filename
-         if [[ -z $uboot_comp_filename ]]; then
-            tpl=$tmp_dir/$uboot_filename
-         else
-            tpl=$tmp_dir/$uboot_comp_filename
-         fi
-      else
-         bl2=$tmp_dir/$ddr_enc_filename
-         tpl=$tmp_dir/$uboot_enc_filename
-         if [[ -z "$ddr_enc_filename" ]] || [[ -z "$uboot_enc_filename" ]]; then
-            echo "Your board is secured but the image you want to flash does not contain any signed bootloader !"
-            echo "Please check, flashing can't continue..."
+    if [[ -n "$target_img" ]]; then
+        echo -n "Unpacking image "
+        local return_value
+        return_value=$("$TOOL_PATH/tools/$SYSTEM/aml_image_v2_packer$EXE" -d "$target_img" "$tmp_dir")
+        print_debug "$return_value"
+        if ! echo "$return_value" | grep -q "Image unpack OK!"; then
+            echo "[KO]"
             cleanup
             exit 1
-         fi
-      fi
-   else
-      print_debug "uboot_file      = $uboot_file"
-      if [[ $soc == "gxl" ]] || [[ $soc == "axg" ]] || [[ $soc == "txlx" ]]; then
-         print_debug "uboot_file      = $uboot_file"
-         bl2=$tmp_dir/uboot_file_bl2.bin
-         tpl=$tmp_dir/uboot_file_tpl.bin
-         dd &>/dev/null if=$uboot_file of=$bl2 bs=49152 count=1
-         dd &>/dev/null if=$uboot_file of=$tpl bs=49152 skip=1
-      else
-         bl2=$tmp_dir/$ddr_filename
-         tpl=$uboot_file
-      fi
-   fi
+        fi
+        echo "[OK]"
 
-   print_debug ""
-   if [[ ! -z "$bl2" ]]; then
-      check_file "$bl2"
-   fi
-   if [[ ! -z "$tpl" ]]; then
-      check_file "$tpl"
-   fi
+        platform_conf_name=$(awk '/sub_type=\"platform\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        print_debug "platform_conf_name = $platform_conf_name"
+        ddr_filename=$(awk '/sub_type=\"DDR\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        print_debug "ddr_filename = $ddr_filename"
+        uboot_filename=$(awk '/sub_type=\"UBOOT\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        print_debug "uboot_filename = $uboot_filename"
+        uboot_comp_filename=$(awk '/sub_type=\"UBOOT_COMP\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        print_debug "uboot_comp_filename = $uboot_comp_filename"
+        dtb_meson_filename=$(awk '/sub_type=\"meson\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        print_debug "dtb_meson_filename = $dtb_meson_filename"
+        dtb_meson1_filename=$(awk '/sub_type=\"meson1\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        print_debug "dtb_meson1_filename = $dtb_meson1_filename"
+        dtb_meson1_enc_filename=$(awk '/sub_type=\"meson1_ENC\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        print_debug "dtb_meson1_enc_filename = $dtb_meson1_enc_filename"
+        ddr_enc_filename=$(awk '/sub_type=\"DDR_ENC\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        print_debug "ddr_enc_filename = $ddr_enc_filename"
+        uboot_enc_filename=$(awk '/sub_type=\"UBOOT_ENC\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        print_debug "uboot_enc_filename = $uboot_enc_filename"
+        keys_filename=$(awk '/sub_type=\"keys\"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        print_debug "keys_filename = $keys_filename"
 
-   echo -n "Initializing ddr "
-   if [[ $soc == "gxl" ]] || [[ $soc == "axg" ]] || [[ $soc == "txlx" ]]; then
-      run_update_assert cwr   "$bl2" $ddr_load
-      run_update_assert write "$ddr" $bl2_params
-      run_update_assert run          $ddr_run
-      for i in {1..8}
-      do
-          echo -n "."
-          sleep 1
-      done
-      run_update_return identify 7
-      if ! `echo $update_return | grep -iq firmware`; then
-         echo -e $RED"[KO]"$RESET
-         cleanup
-         exit 1
-      fi
-      usb_protocol=`echo $update_return|awk -F- '{print $4}'`
-      # If new usb protocol, init DDR
-      if [[ $usb_protocol == "8" ]]; then
-         run_update_assert run $bl2_params
-      fi
-   fi
-   if [[ $soc == "g12a" ]]; then
-      run_update_assert write "$tpl" $ddr_load 0x10000
-      run_update_assert run $ddr_load
-      for i in {1..8}
-      do
-          echo -n "."
-          sleep 1
-      done
-   fi
-   if [[ $soc == "m8" ]]; then
-      for i in {1..6}
-      do
-          echo -n "."
-          sleep 1
-      done
-      run_update_assert cwr "$bl2" $ddr_load
-      run_update_assert run        $ddr_run
-      for i in {1..8}
-      do
-          echo -n "."
-          sleep 1
-      done
-   fi
-   echo -e $GREEN"[OK]"$RESET
+        if [[ -n "$platform_conf_name" && -f "$tmp_dir/$platform_conf_name" ]]; then
+            platform=$(awk '/Platform:/{gsub("Platform:","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "platform = $platform"
+            bin_params=$(awk '/BinPara:/{gsub("BinPara:","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "bin_params = $bin_params"
+            ddr_load=$(awk '/DDRLoad:/{gsub("DDRLoad:","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "ddr_load = $ddr_load"
+            ddr_run=$(awk '/DDRRun:/{gsub("DDRRun:","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "ddr_run = $ddr_run"
+            uboot_down=$(awk '/Uboot_down:/{gsub("Uboot_down:","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "uboot_down = $uboot_down"
+            uboot_decomp=$(awk '/Uboot_decomp:/{gsub("Uboot_decomp:","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "uboot_decomp = $uboot_decomp"
+            uboot_enc_down=$(awk '/Uboot_enc_down:/{gsub("Uboot_enc_down:","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "uboot_enc_down = $uboot_enc_down"
+            uboot_enc_run=$(awk '/Uboot_enc_run:/{gsub("Uboot_enc_run:","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "uboot_enc_run = $uboot_enc_run"
+            uboot_load=$(awk '/UbootLoad:/{gsub("UbootLoad:","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "uboot_load = $uboot_load"
+            uboot_run=$(awk '/UbootRun:/{gsub("UbootRun:","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "uboot_run = $uboot_run"
+            bl2_params=$(awk '/bl2ParaAddr=/{gsub("bl2ParaAddr=","",$1); print $1}' "$tmp_dir/$platform_conf_name")
+            print_debug "bl2_params = $bl2_params"
+        fi
 
-   echo -n "Running u-boot "
-   if [[ $soc == "gxl" ]] || [[ $soc == "axg" ]] || [[ $soc == "txlx" ]]; then
-      run_update_assert write "$bl2" $ddr_load
-      run_update_assert write "$fip" $bl2_params # tell bl2 to jump to tpl, aka u-boot
-      run_update_assert write "$tpl" $uboot_load
-      if [[ $usb_protocol == "8" ]]; then
-         run_update_assert run $bl2_params
-      else
-         run_update_assert run $uboot_run
-      fi
-   fi
-   if [[ $soc == "g12a" ]]; then
-      run_update_assert bl2_boot "$tpl"
-   fi
-   if [[ $soc == "m8" ]]; then
-      run_update_assert write "$fip" $bin_params
-      if [[ $secured == 0 ]]; then
-         run_update_assert write "$tpl" 0x00400000
-         run_update_assert run          $uboot_decomp
-         for i in {1..13}
-         do
-            echo -n "."
-            sleep 1
-         done
-         value=`echo "obase=16;$(($bin_params + 0x18))"|bc`
-         run_update_return rreg 4 0x$value
-         jump_addr=0x`echo $update_return|awk -F: '{gsub(/ /,"",$2);print $2}'`
-         print_debug "Jumping to $jump_addr"
-         run_update_assert run  $jump_addr
-      else
-         run_update_assert write "$tpl" $uboot_enc_down
-         run_update_assert run          $uboot_enc_run
-         for i in {1..8}
-         do
-            echo -n "."
-            sleep 1
-         done
-      fi
-   fi
-   for i in {1..8}
-   do
-       echo -n "."
-       sleep 1
-   done
-   echo -e $GREEN"[OK]"$RESET
+        mapfile -t partitions_file < <(awk '/main_type="PARTITION"/{gsub("file=","",$1); gsub(/"/,"",$1); print $1}' "$tmp_dir/image.cfg")
+        mapfile -t partitions_name < <(awk '/main_type="PARTITION"/{gsub("sub_type=","",$3); gsub(/"/,"",$3); print $3}' "$tmp_dir/image.cfg")
+        mapfile -t partitions_type < <(awk '/main_type="PARTITION"/{gsub("file_type=","",$4); gsub(/"/,"",$4); print $4}' "$tmp_dir/image.cfg")
+        nb_partitions=${#partitions_name[@]}
+        print_debug "nb_partitions = $nb_partitions"
 
-   # Need this command to avoid to loose 4 bytes of commands after reset
-   run_update bulkcmd "echo 12345"
-   #run_update bulkcmd "low_power"
-
-   if [[ $soc == "gxl" ]] || [[ $soc == "axg" ]] || [[ $soc == "txlx" ]] || [[ $soc == "g12a" ]]; then
-      if [[ $secured == 1 ]]; then
-         check_file "$tmp_dir/$dtb_meson1_enc_filename"
-         run_update_assert mwrite "$tmp_dir/$dtb_meson1_enc_filename" mem dtb normal
-      else
-         check_file "$tmp_dir/$dtb_meson1_filename"
-         run_update_assert mwrite "$tmp_dir/$dtb_meson1_filename" mem dtb normal
-      fi
-      if [[ "$parts" != "none" ]]; then
-         echo -n "Create partitions "
-         if [[ $wipe == 1 ]]; then
-            run_update_assert bulkcmd "disk_initial 1"
-          else
-            run_update_assert bulkcmd "disk_initial 0"
-          fi
-          echo -e $GREEN"[OK]"$RESET
-
-          echo -n "Writing device tree "
-          run_update_assert partition _aml_dtb "$dtb_file"
-          echo -e $GREEN"[OK]"$RESET
-
-          echo -n "Writing bootloader "
-          run_update_assert partition bootloader "$bootloader_file"
-          #run_update_assert bulkcmd "env default -a"
-          #run_update_assert bulkcmd "saveenv"
-          echo -e $GREEN"[OK]"$RESET
-      fi
-   else
-      if [[ "$parts" != "none" ]]; then
-         echo -n "Creating partitions "
-         if [[ $wipe == 1 ]]; then
-            run_update bulkcmd "disk_initial 3"
-            run_update_assert bulkcmd "disk_initial 2"
-         else
-            run_update_assert bulkcmd "disk_initial 0"
-         fi
-         echo -e $GREEN"[OK]"$RESET
-
-         echo -n "Writing bootloader "
-         run_update_assert partition bootloader "$bootloader_file"
-         echo -e $GREEN"[OK]"$RESET
-
-         echo -n "Writing device tree "
-         run_update_assert mwrite $dtb_file mem dtb normal
-         echo -e $GREEN"[OK]"$RESET
-      fi
-   fi
-   if [[ "$parts" != "none" ]]; then
-      run_update bulkcmd "setenv upgrade_step 1"
-      run_update bulkcmd "save"
-   fi
-   if [[ "$soc" == "m8" ]]; then
-      run_update bulkcmd "save_setting"
-   fi
-fi
-
-# Check chip version
-# ------------------
-# Chip version is extracted from SEC_AO_SEC_SD_CFG8 register
-# if [[ "$soc" == "gxl" ]]; then
-#    sleep 5
-#    run_update_return rreg 4 0xda100220
-#    value=0x`echo $update_return|awk -F: '{gsub(/ /,"",$2);print $2}'`
-#   print_debug "0xda100220 = $value"
-#   chip_misc=$(($value & 0xff))
-#   value=$(($value >> 8))
-#   chip_minor=$(($value & 0xff))
-#   value=$(($value >> 8))
-#   chip_pack=$(($value & 0xf0))
-#   value=$(($value >> 8))
-#   chip_major=$(($value & 0xff))
-#   printf "Chipset version $GREEN[%X:%X - %X:%X]$RESET\n" $chip_major $chip_minor $chip_pack $chip_misc
-#fi
-#if [[ "$soc" == "axg" ]] || [[ $soc == "txlx" ]] || [[ $soc == "g12a" ]]; then
-#   run_update_return rreg 4 0xff800220
-#   value=0x`echo $update_return|awk -F: '{gsub(/ /,"",$2);print $2}'`
-#   print_debug "0xff800220 = $value"
-#   chip_misc=$(($value & 0xff))
-#   value=$(($value >> 8))
-#   chip_minor=$(($value & 0xff))
-#   value=$(($value >> 8))
-#   chip_pack=$(($value & 0xf0))
-#   value=$(($value >> 8))
-#   chip_major=$(($value & 0xff))
-#   printf "Chipset version $GREEN[%X:%X - %X:%X]$RESET\n" $chip_major $chip_minor $chip_pack $chip_misc
-#fi
-
-# Data and cache partitions wiping
-# --------------------------------
-if [[ $wipe == 1 ]]; then
-   run_update bulkcmd "setenv firstboot 1"
-   run_update bulkcmd "save"
-   run_update bulkcmd "rpmb_reset"
-fi
-if [[ $soc != "m8" ]]; then
-   if [[ $wipe == 1 ]]; then
-      echo -n "Wiping  data partition "
-      run_update bulkcmd "amlmmc erase data"
-      run_update bulkcmd "nand erase.part data"
-      echo -e $GREEN"[OK]"$RESET
-
-      echo -n "Wiping  cache partition "
-      run_update bulkcmd "amlmmc erase cache"
-      run_update bulkcmd "nand erase.part cache"
-      echo -e $GREEN"[OK]"$RESET
+        if [[ -z "$soc" ]]; then
+            detected_platform=$(echo "$platform" | tr '[:upper:]' '[:lower:]')
+            if [[ "$detected_platform" =~ gxl|p212|p281|p271 ]]; then
+                soc="gxl"
+            elif [[ "$detected_platform" =~ gxbb|p200|p201 ]]; then
+                soc="gxbb"
+            elif [[ "$detected_platform" =~ gxm|q200|q201 ]]; then
+                soc="gxm"
+            elif [[ "$detected_platform" =~ g12b|s922x|a311d ]]; then
+                soc="g12b"
+            elif [[ "$detected_platform" =~ sm1|s905x3 ]]; then
+                soc="sm1"
+            elif [[ "$detected_platform" =~ g12a|g12|u200 ]]; then
+                soc="g12a"
+            elif [[ "$detected_platform" =~ axg ]]; then
+                soc="axg"
+            elif [[ "$detected_platform" =~ txlx ]]; then
+                soc="txlx"
+            elif [[ "$detected_platform" =~ m8|meson8 ]]; then
+                soc="m8"
+            fi
+        fi
     fi
-fi
 
-# Program all the partitions
-# --------------------------
-for i in $(seq 0 `expr $nb_partitions - 1`)
-do
-if [[ "$parts" == "all" ]] || [[ "$parts" == "${partitions_name[$i]}" ]] || [[ "$parts" == "dtb" && "${partitions_name[$i]}" == "_aml_dtb" ]]; then
-   if [[ ${partitions_name[$i]} == "bootloader" ]] || [[ ${partitions_name[$i]} == "_aml_dtb" && "$parts" != "dtb" ]]; then
-      continue
-   fi
-   if [[ ${partitions_name[$i]} == "_aml_dtb" ]]; then
-     newvar=dtb_file
-     newvar_type=dtb_file_type
-   else
-     newvar=${partitions_name[$i]}_file
-     newvar_type=${partitions_name[$i]}_file_type
-   fi
-   if [[ "${!newvar}" == "" ]]; then
-     partition_file=$tmp_dir/${partitions_file[$i]}
-   else
-     partition_file=${!newvar}
-   fi
-   if [[ "${!newvar_type}" == "" ]]; then
-     partition_type=${partitions_type[$i]}
-   else
-     partition_type=${!newvar_type}
-   fi
-   check_file $partition_file
-   if [[ $"$parts" == "dtb" ]]; then
-      echo -n "Writing dtb partition "
-   else
-      echo -n "Writing ${partitions_name[$i]} partition "
-   fi
-   run_update_assert partition ${partitions_name[$i]} $partition_file $partition_type
-   echo -e $GREEN"[OK]"$RESET
-fi
-done
+    if [[ -z "$soc" ]]; then
+        soc="gxl"
+    fi
 
-# Terminate burning tool
-# ----------------------
-#echo -n "Terminate update of the board "
-#run_update_assert bulkcmd save_setting
-#echo -e $GREEN"[OK]"$RESET
+    if [[ ! "$soc" =~ ^(m8|gxl|gxbb|gxm|axg|txlx|g12a|g12b|sm1)$ ]]; then
+        echo "Unknown SoC: $soc"
+        cleanup
+        exit 1
+    fi
 
-# eFuse update
-# ------------
-if [[ $efuse_file != "" ]]; then
-   check_file "$efuse_file"
-   echo -n "Programming efuses "
-   run_update_assert write $efuse_file 0x03000000
-   if [[ $soc == "m8" ]]; then
-      run_update_assert bulkcmd "efuse secure_boot_set 0x03000000"
-   else
-      run_update_assert bulkcmd "efuse amlogic_set 0x03000000"
-   fi
-   echo -e $GREEN"[OK]"$RESET
-   #run_update bulkcmd "low_power"
-fi
+    run_update_return identify 7
+    if [[ "$simu" != "1" ]]; then
+        if ! echo "$update_return" | grep -iq firmware; then
+            echo "Amlogic device not found"
+            cleanup
+            exit 1
+        fi
+    fi
 
-# Cleanup
-# -------
-[[ -d $tmp_dir ]] && rm -rf "$tmp_dir"
+    local need_password=0
+    run_update_return identify 7
+    if echo "$update_return" | grep -iq "Password check NG"; then
+        need_password=1
+    fi
+    if [[ $need_password -eq 1 ]]; then
+        if [[ -z "$password" ]]; then
+            echo "The board is locked with a password, please provide a password using --password option!"
+            cleanup
+            exit 1
+        fi
+        echo -n "Unlocking usb interface "
+        run_update_assert password "$password"
+        run_update_return identify 7
+        if echo "$update_return" | grep -iq "Password check OK"; then
+            echo "[OK]"
+        else
+            echo "[KO]"
+            echo "It seems you provided an incorrect password!"
+            cleanup
+            exit 1
+        fi
+    fi
 
-# Resetting board ? 
-# -----------------
-if [[ "$parts" != "none" ]]; then
-   if [[ -z "$reset" ]]; then
-      while true; do
-         read -p "Do you want to reset the board? y/n [n]? " reset
-         if [[ $reset =~ [yYnN] ]]; then
-            break
-         fi
-      done
-   fi
-   if [[ $reset =~ [yY] ]]; then
-      echo -n "Resetting board "
-      run_update bulkcmd "burn_complete 1"
-      echo -e $GREEN"[OK]"$RESET
-   fi
+    local i
+    if [[ "$parts" == "all" || "$parts" == "bootloader" || -z "$parts" || "$parts" == "none" ]]; then
+        if run_update bulkcmd "echo 12345"; then
+            echo -n "Rebooting the board "
+            run_update bulkcmd "bootloader_is_old"
+            run_update_assert bulkcmd "erase_bootloader"
+            if [[ $destroy -eq 1 ]]; then
+                run_update bulkcmd "store erase boot"
+                run_update bulkcmd "amlmmc erase 1"
+                run_update bulkcmd "nand erase 0 4096"
+            fi
+            run_update bulkcmd "reset"
+            if [[ $destroy -eq 1 ]]; then
+                echo "[OK]"
+                cleanup
+                exit 0
+            fi
+            for ((i = 1; i <= 8; i++)); do
+                echo -n "."
+                sleep 1
+            done
+            echo "[OK]"
+        else
+            if [[ $destroy -eq 1 ]]; then
+                echo "Seems board is already in usb mode, nothing to do more..."
+                cleanup
+                exit 0
+            fi
+        fi
+    fi
+
+    if [[ $destroy -eq 1 ]]; then
+        cleanup
+        exit 0
+    fi
+
+    need_password=0
+    run_update_return identify 7
+    if echo "$update_return" | grep -iq "Password check NG"; then
+        need_password=1
+    fi
+    if [[ $need_password -eq 1 ]]; then
+        if [[ -z "$password" ]]; then
+            echo "The board is locked with a password, please provide a password using --password option!"
+            cleanup
+            exit 1
+        fi
+        echo -n "Unlocking usb interface "
+        run_update_assert password "$password"
+        run_update_return identify 7
+        if echo "$update_return" | grep -iq "Password check OK"; then
+            echo "[OK]"
+        else
+            echo "[KO]"
+            echo "It seems you provided an incorrect password!"
+            cleanup
+            exit 1
+        fi
+    fi
+
+    local secured=0
+    local value=0
+    local reg_val=""
+
+    if [[ "$soc" == "gxl" || "$soc" == "gxbb" || "$soc" == "gxm" ]]; then
+        run_update_return rreg 4 0xc8100228
+        reg_val=$(echo "$update_return" | grep -i c8100228 | awk -F: '{gsub(/ /,"",$2);print $2}')
+        if [[ -n "$reg_val" ]]; then
+            value=$(( 0x$reg_val & 0x10 ))
+        fi
+    elif [[ "$soc" == "axg" || "$soc" == "txlx" || "$soc" == "g12a" || "$soc" == "g12b" || "$soc" == "sm1" ]]; then
+        run_update_return rreg 4 0xff800228
+        reg_val=$(echo "$update_return" | grep -i ff800228 | awk -F: '{gsub(/ /,"",$2);print $2}')
+        if [[ -n "$reg_val" ]]; then
+            value=$(( 0x$reg_val & 0x10 ))
+        fi
+    elif [[ "$soc" == "m8" ]]; then
+        run_update_return rreg 4 0xd9018048
+        reg_val=$(echo "$update_return" | grep -i d9018048 | awk -F: '{gsub(/ /,"",$2);print $2}')
+        if [[ -n "$reg_val" ]]; then
+            value=$(( 0x$reg_val & 0x80 ))
+        fi
+    fi
+
+    if [[ $value -ne 0 ]]; then
+        secured=1
+        echo "Board is in secure mode"
+    fi
+
+    local bootloader_file=""
+    local dtb_file=""
+    local ddr=""
+    local fip=""
+    local bl2=""
+    local tpl=""
+
+    if [[ "$parts" == "all" || "$parts" == "bootloader" || "$parts" == "none" ]]; then
+        if [[ "$soc" =~ ^(gxl|gxbb|gxm|axg|txlx)$ ]]; then
+            ddr="$TOOL_PATH/tools/datas/usbbl2runpara_ddrinit.bin"
+            fip="$TOOL_PATH/tools/datas/usbbl2runpara_runfipimg.bin"
+            check_file "$ddr"
+            check_file "$fip"
+        elif [[ "$soc" == "m8" ]]; then
+            fip="$TOOL_PATH/tools/datas/decompressPara_4M.dump"
+            check_file "$fip"
+        fi
+
+        if [[ -z "$bootloader_file" ]]; then
+            for ((i = 0; i < nb_partitions; i++)); do
+                if [[ "${partitions_name[$i]}" == "bootloader" ]]; then
+                    bootloader_file="$tmp_dir/${partitions_file[$i]}"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -z "$dtb_file" ]]; then
+            if [[ "$soc" =~ ^(gxl|gxbb|gxm|axg|txlx|g12a|g12b|sm1)$ ]]; then
+                for ((i = 0; i < nb_partitions; i++)); do
+                    if [[ "${partitions_name[$i]}" == "_aml_dtb" ]]; then
+                        dtb_file="$tmp_dir/${partitions_file[$i]}"
+                        break
+                    fi
+                done
+            elif [[ "$soc" == "m8" ]]; then
+                dtb_file="$tmp_dir/$dtb_meson_filename"
+            fi
+        fi
+
+        if [[ -z "$dtb_file" ]]; then
+            if [[ -n "$dtb_meson_filename" && -f "$tmp_dir/$dtb_meson_filename" ]]; then
+                dtb_file="$tmp_dir/$dtb_meson_filename"
+            elif [[ -n "$dtb_meson1_filename" && -f "$tmp_dir/$dtb_meson1_filename" ]]; then
+                dtb_file="$tmp_dir/$dtb_meson1_filename"
+            fi
+        fi
+
+        print_debug "bootloader_file = $bootloader_file"
+        print_debug "dtb_file = $dtb_file"
+
+        if [[ -n "$bootloader_file" ]]; then
+            check_file "$bootloader_file"
+        fi
+        if [[ -n "$dtb_file" ]]; then
+            check_file "$dtb_file"
+        fi
+
+        if [[ -z "$uboot_file" ]]; then
+            if [[ $secured -eq 0 ]]; then
+                bl2="$tmp_dir/$ddr_filename"
+                if [[ -z "$uboot_comp_filename" ]]; then
+                    tpl="$tmp_dir/$uboot_filename"
+                else
+                    tpl="$tmp_dir/$uboot_comp_filename"
+                fi
+            else
+                bl2="$tmp_dir/$ddr_enc_filename"
+                tpl="$tmp_dir/$uboot_enc_filename"
+                if [[ -z "$ddr_enc_filename" || -z "$uboot_enc_filename" ]]; then
+                    echo "Your board is secured but the image you want to flash does not contain any signed bootloader!"
+                    echo "Please check, flashing cannot continue..."
+                    cleanup
+                    exit 1
+                fi
+            fi
+        else
+            print_debug "uboot_file = $uboot_file"
+            if [[ "$soc" =~ ^(gxl|gxbb|gxm|axg|txlx)$ ]]; then
+                bl2="$tmp_dir/uboot_file_bl2.bin"
+                tpl="$tmp_dir/uboot_file_tpl.bin"
+                dd if="$uboot_file" of="$bl2" bs=49152 count=1 &>/dev/null
+                dd if="$uboot_file" of="$tpl" bs=49152 skip=1 &>/dev/null
+            else
+                bl2="$tmp_dir/$ddr_filename"
+                tpl="$uboot_file"
+            fi
+        fi
+
+        if [[ -n "$bl2" ]]; then
+            check_file "$bl2"
+        fi
+        if [[ -n "$tpl" ]]; then
+            check_file "$tpl"
+        fi
+
+        local usb_protocol=""
+        echo -n "Initializing ddr "
+        if [[ "$soc" =~ ^(gxl|gxbb|gxm|axg|txlx)$ ]]; then
+            run_update_assert cwr "$bl2" "$ddr_load"
+            run_update_assert write "$ddr" "$bl2_params"
+            run_update_assert run "$ddr_run"
+            for ((i = 1; i <= 8; i++)); do
+                echo -n "."
+                sleep 1
+            done
+            run_update_return identify 7
+            if ! echo "$update_return" | grep -iq firmware; then
+                echo "[KO]"
+                cleanup
+                exit 1
+            fi
+            usb_protocol=$(echo "$update_return" | awk -F- '{print $4}')
+            if [[ "$usb_protocol" == "8" ]]; then
+                run_update_assert run "$bl2_params"
+            fi
+        elif [[ "$soc" =~ ^(g12a|g12b|sm1)$ ]]; then
+            run_update_assert write "$tpl" "$ddr_load" 0x10000
+            run_update_assert run "$ddr_load"
+            for ((i = 1; i <= 8; i++)); do
+                echo -n "."
+                sleep 1
+            done
+        elif [[ "$soc" == "m8" ]]; then
+            for ((i = 1; i <= 6; i++)); do
+                echo -n "."
+                sleep 1
+            done
+            run_update_assert cwr "$bl2" "$ddr_load"
+            run_update_assert run "$ddr_run"
+            for ((i = 1; i <= 8; i++)); do
+                echo -n "."
+                sleep 1
+            done
+        fi
+        echo "[OK]"
+
+        echo -n "Running u-boot "
+        if [[ "$soc" =~ ^(gxl|gxbb|gxm|axg|txlx)$ ]]; then
+            run_update_assert write "$bl2" "$ddr_load"
+            run_update_assert write "$fip" "$bl2_params"
+            run_update_assert write "$tpl" "$uboot_load"
+            if [[ "$usb_protocol" == "8" ]]; then
+                run_update_assert run "$bl2_params"
+            else
+                run_update_assert run "$uboot_run"
+            fi
+        elif [[ "$soc" =~ ^(g12a|g12b|sm1)$ ]]; then
+            run_update_assert bl2_boot "$tpl"
+        elif [[ "$soc" == "m8" ]]; then
+            run_update_assert write "$fip" "$bin_params"
+            if [[ $secured -eq 0 ]]; then
+                run_update_assert write "$tpl" 0x00400000
+                run_update_assert run "$uboot_decomp"
+                for ((i = 1; i <= 13; i++)); do
+                    echo -n "."
+                    sleep 1
+                done
+                local value_hex
+                value_hex=$(printf "%X\n" "$((bin_params + 0x18))")
+                run_update_return rreg 4 "0x$value_hex"
+                local jump_addr
+                jump_addr="0x$(echo "$update_return" | awk -F: '{gsub(/ /,"",$2);print $2}')"
+                print_debug "Jumping to $jump_addr"
+                run_update_assert run "$jump_addr"
+            else
+                run_update_assert write "$tpl" "$uboot_enc_down"
+                run_update_assert run "$uboot_enc_run"
+                for ((i = 1; i <= 8; i++)); do
+                    echo -n "."
+                    sleep 1
+                done
+            fi
+        fi
+        for ((i = 1; i <= 8; i++)); do
+            echo -n "."
+            sleep 1
+        done
+        echo "[OK]"
+
+        run_update bulkcmd "echo 12345"
+
+        if [[ "$soc" =~ ^(gxl|gxbb|gxm|axg|txlx|g12a|g12b|sm1)$ ]]; then
+            if [[ $secured -eq 1 ]]; then
+                if [[ -n "$dtb_meson1_enc_filename" && -f "$tmp_dir/$dtb_meson1_enc_filename" ]]; then
+                    run_update_assert mwrite "$tmp_dir/$dtb_meson1_enc_filename" mem dtb normal
+                fi
+            else
+                if [[ -n "$dtb_meson1_filename" && -f "$tmp_dir/$dtb_meson1_filename" ]]; then
+                    run_update_assert mwrite "$tmp_dir/$dtb_meson1_filename" mem dtb normal
+                elif [[ -n "$dtb_meson_filename" && -f "$tmp_dir/$dtb_meson_filename" ]]; then
+                    run_update_assert mwrite "$tmp_dir/$dtb_meson_filename" mem dtb normal
+                elif [[ -n "$dtb_file" && -f "$dtb_file" ]]; then
+                    run_update_assert mwrite "$dtb_file" mem dtb normal
+                fi
+            fi
+            if [[ "$parts" != "none" ]]; then
+                echo -n "Create partitions "
+                if [[ $wipe -eq 1 ]]; then
+                    run_update_assert bulkcmd "disk_initial 1"
+                else
+                    run_update_assert bulkcmd "disk_initial 0"
+                fi
+                echo "[OK]"
+
+                if [[ -n "$dtb_file" && -f "$dtb_file" ]]; then
+                    echo -n "Writing device tree "
+                    run_update_assert partition _aml_dtb "$dtb_file"
+                    echo "[OK]"
+                fi
+
+                if [[ -n "$bootloader_file" && -f "$bootloader_file" ]]; then
+                    echo -n "Writing bootloader "
+                    run_update_assert partition bootloader "$bootloader_file"
+                    echo "[OK]"
+                fi
+            fi
+        else
+            if [[ "$parts" != "none" ]]; then
+                echo -n "Creating partitions "
+                if [[ $wipe -eq 1 ]]; then
+                    run_update bulkcmd "disk_initial 3"
+                    run_update_assert bulkcmd "disk_initial 2"
+                else
+                    run_update_assert bulkcmd "disk_initial 0"
+                fi
+                echo "[OK]"
+
+                echo -n "Writing bootloader "
+                run_update_assert partition bootloader "$bootloader_file"
+                echo "[OK]"
+
+                echo -n "Writing device tree "
+                run_update_assert mwrite "$dtb_file" mem dtb normal
+                echo "[OK]"
+            fi
+        fi
+
+        if [[ "$parts" != "none" ]]; then
+            run_update bulkcmd "setenv upgrade_step 1"
+            run_update bulkcmd "save"
+        fi
+        if [[ "$soc" == "m8" ]]; then
+            run_update bulkcmd "save_setting"
+        fi
+    fi
+
+    if [[ $wipe -eq 1 ]]; then
+        run_update bulkcmd "setenv firstboot 1"
+        run_update bulkcmd "save"
+        run_update bulkcmd "rpmb_reset"
+    fi
+    if [[ "$soc" != "m8" ]]; then
+        if [[ $wipe -eq 1 ]]; then
+            echo -n "Wiping  data partition "
+            run_update bulkcmd "amlmmc erase data"
+            run_update bulkcmd "nand erase.part data"
+            echo "[OK]"
+
+            echo -n "Wiping  cache partition "
+            run_update bulkcmd "amlmmc erase cache"
+            run_update bulkcmd "nand erase.part cache"
+            echo "[OK]"
+        fi
+    fi
+
+    local part_name=""
+    local part_file=""
+    local part_type=""
+    local target_file=""
+    local target_type=""
+
+    for ((i = 0; i < nb_partitions; i++)); do
+        part_name="${partitions_name[$i]}"
+        part_file="${partitions_file[$i]}"
+        part_type="${partitions_type[$i]}"
+        if [[ "$parts" == "all" || "$parts" == "$part_name" || ( "$parts" == "dtb" && "$part_name" == "_aml_dtb" ) ]]; then
+            if [[ "$part_name" == "bootloader" || ( "$part_name" == "_aml_dtb" && "$parts" != "dtb" ) ]]; then
+                continue
+            fi
+            target_file=""
+            target_type=""
+            if [[ "$part_name" == "_aml_dtb" ]]; then
+                target_file="$dtb_file"
+                target_type="dtb"
+            fi
+            if [[ -z "$target_file" ]]; then
+                target_file="$tmp_dir/$part_file"
+            fi
+            if [[ -z "$target_type" ]]; then
+                target_type="$part_type"
+            fi
+            check_file "$target_file"
+            if [[ "$parts" == "dtb" ]]; then
+                echo -n "Writing dtb partition "
+            else
+                echo -n "Writing $part_name partition "
+            fi
+            run_update_assert partition "$part_name" "$target_file" "$target_type"
+            echo "[OK]"
+        fi
+    done
+
+    if [[ -n "$efuse_file" ]]; then
+        check_file "$efuse_file"
+        echo -n "Programming efuses "
+        run_update_assert write "$efuse_file" 0x03000000
+        if [[ "$soc" == "m8" ]]; then
+            run_update_assert bulkcmd "efuse secure_boot_set 0x03000000"
+        else
+            run_update_assert bulkcmd "efuse amlogic_set 0x03000000"
+        fi
+        echo "[OK]"
+    fi
+
+    if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
+        rm -rf "$tmp_dir"
+    fi
+
+    if [[ "$parts" != "none" ]]; then
+        if [[ -z "$reset" ]]; then
+            while true; do
+                read -r -p "Do you want to reset the board? y/n [n]? " reset
+                if [[ "$reset" =~ ^[yYnN]$ ]]; then
+                    break
+                fi
+            done
+        fi
+        if [[ "$reset" =~ ^[yY]$ ]]; then
+            echo -n "Resetting board "
+            run_update bulkcmd "burn_complete 1"
+            echo "[OK]"
+        fi
+    else
+        echo "Uboot is now loaded into your board!"
+        echo "You can use $TOOL_PATH/tools/$SYSTEM/update$EXE bulkcmd \"any uboot command\" to control uboot"
+        echo "Examples:"
+        echo "   - Select eMMC device:"
+        echo "   update bulkcmd \"mmc dev 1\""
+        echo "   - Read first block of eMMC at address 0x03000000"
+        echo "   update bulkcmd \"mmc read 0x03000000 0 1\""
+        echo "   - Save 512 bytes from address to 0x03000000 to host pc in file emmc.bin"
+        echo "   update mread mem 0x03000000 normal 512 emmc.bin"
+        echo "   - Write a file from host PC to address 0x03000000"
+        echo "   update mwrite file.bin mem 0x03000000 normal"
+        echo "   - Write to eMMC first block from address 0x03000000"
+        echo "   update bulkcmd \"mmc write 0x03000000 0 1\""
+        echo "   - Booting a kernel"
+        echo "   update bulkcmd \"disk_initial 0\""
+        echo "   update bulkcmd \"env default -a\""
+        echo "   update bulkcmd \"run storeargs\""
+        echo "   update bulkcmd \"run bootcmd\""
+    fi
+}
+
+parse_args "$@"
+
+if [[ $tui -eq 1 ]]; then
+    run_tui
 else
-   echo "Uboot is now loaded into your board !"
-   echo "You can use $TOOL_PATH/tools/update bulkcmd \"any uboot command\" to control uboot"
-   echo "Examples :"
-   echo "   - Select eMMC device :"
-   echo "   update bulkcmd \"mmc dev 1\""
-   echo "   - Read first block of eMMC at address 0x03000000"
-   echo "   update bulkcmd \"mmc read 0x03000000 0 1\""
-   echo "   - Save 512 bytes from address to 0x03000000 to host pc in file emmc.bin"
-   echo "   update mread mem 0x03000000 normal 512 emmc.bin"
-   echo "   - Write a file from host PC to address 0x03000000"
-   echo "   update mwrite file.bin mem 0x03000000 normal"
-   echo "   - Write to eMMC first block from address 0x03000000"
-   echo "   update bulkcmd \"mmc write 0x03000000 0 1\""
-   echo "   - Booting a kernel"
-   echo "   update bulkcmd \"disk_initial 0\""
-   echo "   update bulkcmd \"env default -a\""
-   echo "   update bulkcmd \"run storeargs\""
-   echo "   update bulkcmd \"run bootcmd\""
+    execute_flash
 fi
